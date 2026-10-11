@@ -369,17 +369,6 @@ static constexpr __device__ int ggml_cuda_mmq_get_sram_stride(ggml_type type, in
     return ggml_cuda_mmq_get_sram_stride(ggml_cuda_mmq_get_sram_layout(type, J, fallback));
 }
 
-static __host__ int ggml_cuda_mmq_get_J_max(const ggml_type type, const bool fallback, const int cc, const int64_t ne11) {
-    int ret = std::min(ne11, int64_t(512));
-    ret -= ret % 8;
-    for (;ret > 0; ret -= 8) {
-        if (ggml_cuda_mmq_get_config(type, ret, fallback, cc).type != GGML_TYPE_COUNT) {
-            return ret;
-        }
-    }
-    return ret;
-}
-
 static constexpr __device__ int ggml_cuda_mmq_get_rows_per_warp(ggml_type type, int J, bool fallback) {
     return ggml_cuda_mmq_get_config(type, J, fallback).rows_per_warp();
 }

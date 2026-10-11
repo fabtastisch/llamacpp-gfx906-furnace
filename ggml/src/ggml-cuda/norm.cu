@@ -1030,11 +1030,19 @@ bool ggml_cuda_op_rms_norm_scale2(ggml_backend_cuda_context & ctx, ggml_tensor *
             memcmp(n0->op_params, n1->op_params, sizeof(float)) != 0 || memcmp(sc0->op_params, sc1->op_params, 2 * sizeof(float)) != 0) {
         return false;
     }
-    // the second pair must not read the first pair's output, and the outputs must not overlap
-    const char * a0 = (const char *) sc0->data; const char * a1 = a0 + ggml_nbytes(sc0);
-    const char * b0 = (const char *) sc1->data; const char * b1 = b0 + ggml_nbytes(sc1);
-    const char * r0 = (const char *) x1->data;  const char * r1 = r0 + ggml_nbytes(x1);
-    if ((a0 < b1 && b0 < a1) || (a0 < r1 && r0 < a1)) {
+    // both pairs run at once, so neither output may land on an input the other pair is still reading: the second pair
+    // runs ahead of its graph position, where x0 is already dead and gallocr may have put sc1 on top of it. an output
+    // may only sit on its own input in place, element for element
+    const auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const char * a0 = (const char *) a->data; const char * a1 = a0 + ggml_nbytes(a);
+        const char * b0 = (const char *) b->data; const char * b1 = b0 + ggml_nbytes(b);
+        return a0 < b1 && b0 < a1;
+    };
+    const auto in_place = [](const ggml_tensor * out, const ggml_tensor * in) {
+        return out->data == in->data && ggml_are_same_shape(out, in) && ggml_are_same_stride(out, in);
+    };
+    if (overlap(sc0, sc1) || overlap(sc0, x1) || overlap(sc1, x0) ||
+            (overlap(sc0, x0) && !in_place(sc0, x0)) || (overlap(sc1, x1) && !in_place(sc1, x1))) {
         return false;
     }
     float eps, sv, bv;

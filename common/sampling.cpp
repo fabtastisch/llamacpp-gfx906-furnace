@@ -736,6 +736,8 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
     std::vector<llama_token> result;
     result.reserve(idxs.size());
 
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+
     // draws come from the sampler's own stream, so they stay independent of what was drafted
     std::uniform_real_distribution<float> uni(0.0f, 1.0f);
 
@@ -791,6 +793,12 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
         if (q_x > 0.0f && (p_x >= q_x || uni(gsmpl->rng) < p_x / q_x)) {
             common_sampler_accept(gsmpl, draft[i], true);
             result.push_back(draft[i]);
+
+            // an accepted EOG ends the sequence: nothing after it is output, so nothing after it may enter the
+            // context (replays take server_accept_replay, so unlike the matching path no trailing case is needed)
+            if (llama_vocab_is_eog(vocab, draft[i])) {
+                return result;
+            }
             continue;
         }
 

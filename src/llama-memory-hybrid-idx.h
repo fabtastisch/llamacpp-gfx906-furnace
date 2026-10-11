@@ -187,6 +187,10 @@ private:
     // a cell filled again at the same position keeps its block, which then needs its key re-pooled
     mutable std::vector<uint32_t> qsa_rm_cells;
 
+    // qsa_prepare skipped a ratio's layout update for this ubatch (window inside the top-k budget): its layout has not
+    // seen qsa_rm_cells yet, so the ubatch's set_input_qsa calls must leave them for its next update
+    mutable bool qsa_rm_keep = false;
+
     // block-key cache
     std::map<int32_t, ggml_tensor *> qsa_blk_k;
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> qsa_blk_bufs;

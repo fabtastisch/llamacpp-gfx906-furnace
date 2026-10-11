@@ -1178,8 +1178,10 @@ void llama_memory_hybrid_idx::set_input_qsa(
         }
     }
 
-    // every cached layout has now seen the removals
-    qsa_rm_cells.clear();
+    // every cached layout has now seen the removals, unless qsa_prepare skipped one
+    if (!qsa_rm_keep) {
+        qsa_rm_cells.clear();
+    }
 
     qsa_last_kind[ratio] = last_kind;
 }
@@ -1187,6 +1189,7 @@ void llama_memory_hybrid_idx::set_input_qsa(
 void llama_memory_hybrid_idx::qsa_prepare(const llama_ubatch & ubatch, uint32_t lo, int64_t n_kv,
         std::map<uint32_t, qsa_blk_plan> & plans) const {
     plans.clear();
+    qsa_rm_keep = false;
 
     if (qsa_blk_k.empty() || !mem_idx || mem_idx->get_n_stream() != 1 || ubatch.n_tokens == 0) {
         return;
@@ -1197,6 +1200,12 @@ void llama_memory_hybrid_idx::qsa_prepare(const llama_ubatch & ubatch, uint32_t 
     std::vector<int32_t> blk_pos_v;
 
     bool skipped = false;
+
+    // LLAMA_QSA_BLK_STATS: how often a ratio's block keys come from the cache, are all pooled again because the layout
+    // was rebuilt or because more blocks changed than the graph re-pools, or are pooled with no cache at all
+    static const bool stats = getenv("LLAMA_QSA_BLK_STATS") != nullptr;
+    static int64_t n_stat[4] = {};
+    static int64_t n_stat_calls = 0;
 
     for (const uint32_t r : qsa_ratios) {
         qsa_blk_plan & plan = plans[r];
@@ -1249,10 +1258,12 @@ void llama_memory_hybrid_idx::qsa_prepare(const llama_ubatch & ubatch, uint32_t 
             // no layout that keeps block ids: pool everything, no cache
             ks.valid = false;
             plan.mode = 0;
+            n_stat[0]++;
             continue;
         }
 
-        if (ks.valid && ks.gen == gen && ks.n_keyed <= n_bid) {
+        const bool same_layout = ks.valid && ks.gen == gen && ks.n_keyed <= n_bid;
+        if (same_layout) {
             std::vector<int32_t> bids;
             for (int32_t b = ks.n_keyed; b < n_bid; ++b) {
                 bids.push_back(b);
@@ -1270,6 +1281,7 @@ void llama_memory_hybrid_idx::qsa_prepare(const llama_ubatch & ubatch, uint32_t 
                 plan.bids = std::move(bids);
                 ks.n_keyed = n_bid;
                 dirty->clear();
+                n_stat[3]++;
                 continue;
             }
         }
@@ -1280,6 +1292,12 @@ void llama_memory_hybrid_idx::qsa_prepare(const llama_ubatch & ubatch, uint32_t 
         ks.gen     = gen;
         ks.n_keyed = n_bid;
         dirty->clear();
+        n_stat[same_layout ? 2 : 1]++;
+    }
+
+    if (stats && ++n_stat_calls % 256 == 0) {
+        LLAMA_LOG_WARN("%s: %" PRId64 " ubatches: cache %" PRId64 ", full pool on new layout %" PRId64 ", on overflow %" PRId64 ", no cache %" PRId64 "\n",
+                __func__, n_stat_calls, n_stat[3], n_stat[1], n_stat[2], n_stat[0]);
     }
 
     // every ratio's layout has seen the removals, so set_input_qsa for this ubatch finds nothing new. a ratio that
@@ -1287,6 +1305,7 @@ void llama_memory_hybrid_idx::qsa_prepare(const llama_ubatch & ubatch, uint32_t 
     if (!skipped) {
         qsa_rm_cells.clear();
     }
+    qsa_rm_keep = skipped;
 }
 
 void llama_memory_hybrid_idx::set_input_qsa_re(ggml_tensor * re_cells, ggml_tensor * re_pos, ggml_tensor * re_ids, uint32_t ratio,

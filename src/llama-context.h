@@ -323,6 +323,13 @@ private:
     ggml_backend_dev_t   ev_nextn_dev[2]   = {nullptr, nullptr};
     uint32_t             ev_nextn_no[2]    = {0, 0};
 
+    // unmasked nextn rows land in ubatch order; the original batch index of each row, per half. The split can
+    // reorder tokens (split_equal takes the same count from every sequence), and readers index by batch position
+    std::vector<int32_t> nextn_batch_idxs[2];
+
+    // put the rows of a half back in batch order, once its copies have landed
+    void nextn_reorder(int half);
+
     float * embd_nextn_base(uint32_t decode_no);
 
     // nextn rows carried across an output buffer reallocation

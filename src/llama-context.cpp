@@ -1082,8 +1082,57 @@ float * llama_context::embd_nextn_base(uint32_t decode_no) {
 
 float * llama_context::get_embeddings_nextn() {
     output_reorder();
+    nextn_reorder(n_decodes & 1);
 
     return embd_nextn_base(n_decodes);
+}
+
+void llama_context::nextn_reorder(int half) {
+    std::vector<int32_t> & idxs = nextn_batch_idxs[half];
+    if (idxs.empty() || embd_nextn.data == nullptr || cparams.embeddings_nextn_masked) {
+        idxs.clear();
+        return;
+    }
+
+    // a decode that lost track of its rows ({-1}) or stopped part way leaves a map that is no permutation
+    for (const int32_t j : idxs) {
+        if (j < 0 || (size_t) j >= idxs.size()) {
+            idxs.clear();
+            return;
+        }
+    }
+
+    // LLAMA_NEXTN_REORDER_LOG: count the decodes whose rows were out of batch order
+    static const bool log_reorder = getenv("LLAMA_NEXTN_REORDER_LOG") != nullptr;
+    if (log_reorder) {
+        static int64_t n_seen = 0;
+        static int64_t n_reordered = 0;
+        n_seen++;
+        for (size_t i = 0; i < idxs.size(); ++i) {
+            if (idxs[i] != (int32_t) i) {
+                n_reordered++;
+                LLAMA_LOG_WARN("%s: decode rows out of batch order: %" PRId64 " of %" PRId64 " decodes (%zu rows)\n",
+                        __func__, n_reordered, n_seen, idxs.size());
+                break;
+            }
+        }
+    }
+
+    const size_t n_embd = model.hparams.n_embd_out();
+    float * base = embd_nextn.data + (size_t) half * cparams.n_batch * n_embd;
+
+    // row i holds batch index idxs[i]: swap it to its place until row i holds batch index i (after upstream 4453b535f)
+    for (size_t i = 0; i < idxs.size(); ++i) {
+        while (idxs[i] != (int32_t) i) {
+            const int32_t j = idxs[i];
+            if (idxs[j] == j) {
+                break;   // a repeated index: not a permutation, keep what is in place
+            }
+            std::swap_ranges(base + i*n_embd, base + (i + 1)*n_embd, base + (size_t) j*n_embd);
+            std::swap(idxs[i], idxs[j]);
+        }
+    }
+    idxs.clear();
 }
 
 float * llama_context::get_embeddings_nextn_for(uint32_t decode_no) {
@@ -1102,6 +1151,7 @@ float * llama_context::get_embeddings_nextn_for(uint32_t decode_no) {
     }
 
     ggml_backend_event_synchronize(ev_nextn[half]);
+    nextn_reorder(half);
 
     return embd_nextn_base(decode_no);
 }
@@ -1121,6 +1171,7 @@ float * llama_context::get_embeddings_nextn_ith(int32_t i) {
             if (i < 0 || (uint32_t) i >= cparams.n_batch) {
                 throw std::runtime_error(format("out of range [0, %u)", cparams.n_batch));
             }
+            nextn_reorder(n_decodes & 1);
             return embd_nextn_base(n_decodes) + (size_t) i * n_embd;
         }
 
@@ -2064,6 +2115,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // a decode that failed to find a memory slot above never reaches this point, so a batch the
     // caller retries at a smaller size does not flip the nextn buffer twice
     n_decodes++;
+    nextn_batch_idxs[n_decodes & 1].clear();
 
     ggml_backend_t backend_nextn = nullptr;
 
@@ -2251,6 +2303,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) (masked ? embd_nextn.size : (size_t) cparams.n_batch*n_embd));
                 const int64_t t_get0 = ggml_time_us();
                 ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
+                if (!masked) {
+                    // a map that does not cover every row so far is no permutation: leave this decode's rows as they are
+                    auto & idxs = nextn_batch_idxs[n_decodes & 1];
+                    if (ubatch.data && ubatch.data->batch_idxs.size() == ubatch.n_tokens && idxs.size() == (size_t) offset) {
+                        idxs.insert(idxs.end(), ubatch.data->batch_idxs.begin(), ubatch.data->batch_idxs.end());
+                    } else {
+                        idxs.assign(1, -1);
+                    }
+                }
                 if (decode_time_log()) {
                     LLAMA_LOG_INFO("%s: ubatch %u tokens: nextn get_async %.1f ms (%.1f MB, backend %s)\n", __func__,
                             ubatch.n_tokens, (ggml_time_us() - t_get0) / 1000.0, n_rows*n_embd*4.0/1e6, ggml_backend_name(backend_h));

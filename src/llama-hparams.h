@@ -191,6 +191,7 @@ struct llama_hparams {
     uint32_t ssm_d_state = 0;
     uint32_t ssm_dt_rank = 0;
     uint32_t ssm_n_group = 0;
+    bool     ssm_gate_silu = false; // gated delta net output gate: silu instead of sigmoid (qwen4exp)
 
     // for MiniMax-Text-01 linear attention
     uint32_t n_embd_head_la = 0;

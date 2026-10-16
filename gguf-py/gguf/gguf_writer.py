@@ -1196,6 +1196,9 @@ class GGUFWriter:
     def add_ssm_dt_b_c_rms(self, value: bool) -> None:
         self.add_bool(Keys.SSM.DT_B_C_RMS.format(arch=self.arch), value)
 
+    def add_ssm_gate_silu(self, value: bool) -> None:
+        self.add_bool(Keys.SSM.GATE_SILU.format(arch=self.arch), value)
+
     def add_expert_latent_length(self, value: int) -> None:
         self.add_uint32(Keys.LLM.EXPERT_LATENT_LENGTH.format(arch=self.arch), value)
 

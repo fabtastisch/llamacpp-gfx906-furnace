@@ -345,6 +345,7 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_SSM_TIME_STEP_RANK, "%s.ssm.time_step_rank" },
     { LLM_KV_SSM_GROUP_COUNT,    "%s.ssm.group_count"    },
     { LLM_KV_SSM_DT_B_C_RMS,     "%s.ssm.dt_b_c_rms"     },
+    { LLM_KV_SSM_GATE_SILU,      "%s.ssm.gate_silu"      },
 
     { LLM_KV_KDA_HEAD_DIM,         "%s.kda.head_dim"         },
     { LLM_KV_KDA_SAFE_GATE,        "%s.kda.safe_gate"        },

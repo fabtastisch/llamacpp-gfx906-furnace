@@ -290,6 +290,7 @@ class Keys:
         TIME_STEP_RANK = "{arch}.ssm.time_step_rank"
         GROUP_COUNT    = "{arch}.ssm.group_count"
         DT_B_C_RMS     = "{arch}.ssm.dt_b_c_rms"
+        GATE_SILU      = "{arch}.ssm.gate_silu"
 
     class KDA:
         HEAD_DIM         = "{arch}.kda.head_dim"

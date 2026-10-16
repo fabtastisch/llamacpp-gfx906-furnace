@@ -88,11 +88,24 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         self.gguf_writer.add_hyper_connection_count(hp["hc_count"])
         self.gguf_writer.add_hyper_connection_low_rank(hp["hc_lowrank"])
 
+        # llama.cpp sizes both GDN head dims from ssm.state_size
+        if hp["linear_key_head_dim"] != hp["linear_value_head_dim"]:
+            raise ValueError(f"linear_key_head_dim {hp['linear_key_head_dim']} != linear_value_head_dim "
+                             f"{hp['linear_value_head_dim']}: not supported by the qwen4exp graph")
+        # the reference gates the GDN output with output_gate_type, else hidden_act
+        gate = hp.get("output_gate_type") or hp.get("hidden_act", "silu")
+        if gate not in ("sigmoid", "silu"):
+            raise ValueError(f"unsupported GDN output gate {gate!r}")
+        self.gguf_writer.add_ssm_gate_silu(gate == "silu")
+        self.gguf_writer.add_expert_weights_norm(bool(hp.get("norm_topk_prob", True)))
+
         n_layer = hp["num_hidden_layers"]
-        self.gguf_writer.add_indexer_head_count(hp["indexer_n_heads"])
-        self.gguf_writer.add_indexer_key_length(hp["indexer_head_dim"])
-        self.gguf_writer.add_indexer_top_k(hp["indexer_budget"])
-        ratio = hp["indexer_compress_ratio"]
+        # QSA is optional in the reference: without an indexer every attention layer is dense
+        ratio = hp.get("indexer_compress_ratio") or 0
+        if ratio > 0:
+            self.gguf_writer.add_indexer_head_count(hp["indexer_n_heads"])
+            self.gguf_writer.add_indexer_key_length(hp["indexer_head_dim"])
+            self.gguf_writer.add_indexer_top_k(hp["indexer_budget"])
         layer_types = hp["layer_types"]
         # the released config says "full_attention"; transformers renames those layers "qwen_sparse_attention"
         # on load, so any config it saved again (fine-tunes, later releases) only has the new name
@@ -103,9 +116,12 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         self.gguf_writer.add_attention_compress_ratios(ratios)
 
         # ple_layer_ids is 1-based in the HF config; empty means no n-gram table
-        ple_layers = [i - 1 for i in hp["ple_layer_ids"]]
+        ple_layers = [i - 1 for i in (hp.get("ple_layer_ids") or [])]
         if not ple_layers or self.mtp_only:
             return
+        # each PLE layer has its own table and hash constants; the GGUF layout holds one
+        if len(ple_layers) > 1:
+            raise ValueError(f"ple_layer_ids {hp['ple_layer_ids']}: only one PLE layer is supported")
         self.gguf_writer.add_ple_layers(ple_layers)
         self.gguf_writer.add_ple_ngram_size(hp["ngram_size"])
         self.gguf_writer.add_ple_heads_per_ngram(hp["heads_per_ngram"])

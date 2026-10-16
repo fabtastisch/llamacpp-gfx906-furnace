@@ -502,8 +502,30 @@ struct llama_mmap::impl {
                 advise(range.first, range.second, POSIX_MADV_WILLNEED, "POSIX_MADV_WILLNEED");
             }
         }
+        // LLAMA_LAZY_PIN=1: keep the lazy rows resident. They are gathered at random, so a page not in RAM costs an
+        // SSD read per row (a new 10K-token prompt touched ~50K pages of the 27 GiB qwen4exp n-gram table)
+        static const bool pin = getenv("LLAMA_LAZY_PIN") != nullptr && atoi(getenv("LLAMA_LAZY_PIN")) != 0;
         for (const auto & range : lazy_ranges) {
             advise(range.first, range.second, POSIX_MADV_RANDOM, "POSIX_MADV_RANDOM");
+            if (!pin) {
+                continue;
+            }
+            const size_t page_size = sysconf(_SC_PAGESIZE);
+            const size_t beg = range.first & ~(page_size - 1);
+            const size_t end = std::min((range.second + page_size - 1) & ~(page_size - 1), file->size());
+            if (beg >= end) {
+                continue;
+            }
+            const int64_t t0 = ggml_time_us();
+            if (mlock((char *) addr + beg, end - beg) == 0) {
+                LLAMA_LOG_INFO("%s: pinned %.2f GiB of lazy rows in %.1f s\n", __func__,
+                        (end - beg)/1073741824.0, (ggml_time_us() - t0)/1e6);
+            } else {
+                // usually RLIMIT_MEMLOCK: raise it (systemd LimitMEMLOCK=infinity, ulimit -l)
+                LLAMA_LOG_WARN("%s: mlock of %.2f GiB of lazy rows failed: %s; prefetching them instead\n", __func__,
+                        (end - beg)/1073741824.0, strerror(errno));
+                advise(range.first, range.second, POSIX_MADV_WILLNEED, "POSIX_MADV_WILLNEED");
+            }
         }
         if (numa) {
             if (posix_madvise(addr, file->size(), POSIX_MADV_RANDOM)) {

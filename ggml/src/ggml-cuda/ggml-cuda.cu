@@ -4313,7 +4313,8 @@ static bool ggml_cuda_match_qsa_pool(const ggml_cgraph * cgraph, int i, ggml_cud
         return false;
     }
     const int r = (int) mem->ne[1];
-    if (r < 2 || r > 64 || ggml_node_get_use_count(cgraph, i + 1) != r) {
+    // the pool kernel loads one member per lane of a 32-lane half
+    if (r < 2 || r > 32 || ggml_node_get_use_count(cgraph, i + 1) != r) {
         return false;
     }
 

@@ -1164,7 +1164,7 @@ bool ggml_cuda_qsa_pool_ok(const ggml_tensor * get_rows, const ggml_tensor * sca
         idx->ne[1] == k->ne[2] && w->type == GGML_TYPE_F32 && ggml_nelements(w) == 128 && ggml_is_contiguous(w) &&
         rope->type == GGML_TYPE_F32 && ggml_is_contiguous(rope) && rope->ne[0] == 128 && rope->ne[1] == 1 &&
         rope->src[2] == nullptr && (mode & GGML_ROPE_TYPE_MROPE) && mode != GGML_ROPE_TYPE_VISION &&
-        n_offs == 0 && n_dims > 0 && n_dims <= 128 && n_dims % 2 == 0 &&
+        n_offs == 0 && n_dims > 0 && n_dims <= 64 && n_dims % 2 == 0 && // one rotated pair per lane of a 32-lane half
         ggml_nelements(scale) == ggml_nelements(rope) && ggml_nelements(rms_norm) == ggml_nelements(rope);
 }
 

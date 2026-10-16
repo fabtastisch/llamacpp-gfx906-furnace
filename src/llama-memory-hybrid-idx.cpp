@@ -1145,15 +1145,13 @@ void llama_memory_hybrid_idx::set_input_qsa(
                         continue;
                     }
 
-                    // finite, so it can never meet a -inf and produce a nan
-                    cur_blk_bias[b] = bid_idx[b] >= tail_start ? 1e9f : 0.0f;
+                    // +inf marks the tail, which GGML_OP_QSA_MASK always keeps
+                    cur_blk_bias[b] = bid_idx[b] >= tail_start ? INFINITY : 0.0f;
                 }
 
-                // the spare block holds the unpooled cells, which are the incomplete tail, so
-                // it gets the tail value. it must stay finite: a sequence with fewer than
-                // `ratio` cells owns no full block, and a row of -inf only gives a nan.
+                // the spare block holds the unpooled cells, which are the incomplete tail
                 if (have_dead) {
-                    cur_blk_bias[dead_bid] = 1e9f;
+                    cur_blk_bias[dead_bid] = INFINITY;
                 }
 
                 continue;
@@ -1210,8 +1208,9 @@ void llama_memory_hybrid_idx::qsa_prepare(const llama_ubatch & ubatch, uint32_t 
     for (const uint32_t r : qsa_ratios) {
         qsa_blk_plan & plan = plans[r];
 
-        // the graph scores only past the top-k budget; inside it nothing is pooled and no layout is updated
-        if (n_kv <= (int64_t) hparams_idx.indexer_top_k + r - 1) {
+        // the graph scores only past what a selection keeps (whole blocks plus the tail); inside it nothing is pooled
+        // and no layout is updated
+        if (n_kv <= (int64_t) (hparams_idx.indexer_top_k/r)*r + r - 1) {
             skipped = true;
             continue;
         }

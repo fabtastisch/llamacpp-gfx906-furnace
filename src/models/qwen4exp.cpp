@@ -768,11 +768,16 @@ public:
         mctx(mctx), ratio(ratio), blk_bias(blk_bias), scores(scores) {}
     virtual ~llm_graph_input_qsa() = default;
 
-    // the indexer scores the cells only when the window holds more than the top-k budget: with fewer, the top-k keeps
-    // every cell and the attention mask is the KQ mask itself (GGML_OP_QSA_MASK path only)
+    // the most cells a selection keeps: top_k/ratio whole blocks plus a tail of up to ratio - 1 cells
+    static int64_t max_kept(uint32_t ratio, uint32_t top_k) {
+        return (int64_t) (top_k/ratio)*ratio + ratio - 1;
+    }
+
+    // the indexer scores the cells only when the window holds more than a selection can keep: with fewer, every block
+    // is kept and the attention mask is the KQ mask itself (GGML_OP_QSA_MASK path only)
     static bool need_scores(int64_t n_kv, uint32_t ratio, uint32_t top_k, bool mask_op) {
         static const bool always = getenv("LLAMA_QSA_ALWAYS_SCORE") != nullptr;
-        return always || !mask_op || n_kv > (int64_t) top_k + ratio - 1;
+        return always || !mask_op || n_kv > max_kept(ratio, top_k);
     }
 
     void set_input(const llama_ubatch * ubatch) override {
@@ -919,14 +924,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     // the rest is the visible/not test the attention mask already carries, so upload the per-block half only: 1/ratio of the cells
     // alibi writes distances instead of a mask and non-causal keeps future cells, so both opt out
     // the mask also holds an mrope rule for the query's own position, but only 2d image positions can differ there
-    const bool blk_bias = kq_mask != nullptr &&
+    // GGML_OP_QSA_MASK builds the attention mask straight from these block scores; it needs a caller that takes the mask
+    const bool blk_bias = kq_mask != nullptr && is_mask != nullptr &&
         kq_mask->ne[0] == n_kv && kq_mask->ne[1] == n_tps && kq_mask->ne[3] == n_stream &&
         cparams.causal_attn && !hparams.use_alibi;
-
-    // GGML_OP_QSA_MASK builds the attention mask straight from the block scores (no per-cell expansion, top-k and
-    // mask rebuild); it needs the per-block bias and a caller that takes the mask. LLAMA_QSA_MASK=0 restores the old path
-    static const bool mask_op_env = getenv("LLAMA_QSA_MASK") == nullptr || atoi(getenv("LLAMA_QSA_MASK")) != 0;
-    const bool mask_op = mask_op_env && blk_bias && is_mask != nullptr;
+    const bool mask_op = blk_bias;
 
     // nothing above depends on the layer, so the layers sharing a ratio share one input set
     llm_graph_input_qsa * inp = nullptr;
@@ -1076,28 +1078,23 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         score = ggml_add(ctx0, score, inp->bias);
     }
 
-    // the reference returns indexer_top_k + compress_ratio - 1: whole blocks plus the tail
-    const int64_t width = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
-
+    // the reference keeps the top_k/r best whole blocks plus the tail, which the bias scores +inf
     if (mask_op) {
-        ggml_tensor * mask = ggml_qsa_mask(ctx0, score, inp->cell_blk, kq_mask, (int) width);
+        ggml_tensor * mask = ggml_qsa_mask(ctx0, score, inp->cell_blk, kq_mask, (int) (hparams.indexer_top_k/r));
         cb(mask, "indexer_qsa_mask", il);
         *is_mask = true;
         return mask;
     }
 
-    // every token of a block gets the block score; the budget is whole blocks, so top-k cuts on a block boundary
+    const int64_t width = std::min<int64_t>(n_kv, llm_graph_input_qsa::max_kept((uint32_t) r, hparams.indexer_top_k));
+
+    // the per-cell bias (no usable KQ mask, non-causal, alibi): every token of a block gets the block score and a top-k
+    // keeps `width` cells, which can include part of a block past the budget
     ggml_tensor * expanded = ggml_get_rows(ctx0,
             ggml_cont(ctx0, ggml_permute(ctx0, score, 1, 0, 2, 3)), inp->cell_blk);
     expanded = ggml_cont(ctx0, ggml_permute(ctx0, expanded, 1, 0, 2, 3));
 
-    if (blk_bias) {
-        // flash attention keeps the mask in f16; the scores are f32
-        ggml_tensor * mask = kq_mask->type == GGML_TYPE_F32 ? kq_mask : ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
-        expanded = ggml_add(ctx0, expanded, ggml_reshape_3d(ctx0, mask, n_kv, n_tps, n_stream));
-    } else {
-        expanded = ggml_add(ctx0, expanded, inp->bias);
-    }
+    expanded = ggml_add(ctx0, expanded, inp->bias);
     cb(expanded, "indexer_score_tokens", il);
 
     ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, expanded, width));
@@ -1154,7 +1151,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     // the selection's mask came straight from GGML_OP_QSA_MASK (or is the KQ mask when the window fits the budget)
     if (is_mask) {
         const int64_t r     = hparams.dsv4_compress_ratios[il];
-        const int64_t width = std::min<int64_t>(kq_mask->ne[0], (int64_t) hparams.indexer_top_k + r - 1);
+        const int64_t width = std::min<int64_t>(kq_mask->ne[0], llm_graph_input_qsa::max_kept((uint32_t) r, hparams.indexer_top_k));
 
         ggml_tensor * cur = build_attn_mha(q_cur, mctx_cur->get_k(ctx0, il), mctx_cur->get_v(ctx0, il), nullptr, top_k,
                 nullptr, nullptr, width, kq_scale, il);

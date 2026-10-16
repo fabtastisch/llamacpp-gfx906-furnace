@@ -2830,19 +2830,19 @@ struct test_qsa_mask : public test_case {
     const int64_t n_kv;
     const int64_t n_tps;
     const int64_t n_stream;
-    const int width;
+    const int n_top;    // blocks kept besides the tail
     const int ties;     // 0: distinct scores, 1: few distinct values, 2: all equal
     const float p_vis;  // share of cells the mask keeps
 
     std::string vars() override {
-        return VARS_TO_STR7(type, n_kv, n_tps, n_stream, width, ties, p_vis);
+        return VARS_TO_STR7(type, n_kv, n_tps, n_stream, n_top, ties, p_vis);
     }
 
     double max_err() override { return 0.0; }
 
     test_qsa_mask(ggml_type type = GGML_TYPE_F16, int64_t n_kv = 4096, int64_t n_tps = 3, int64_t n_stream = 1,
-            int width = 2051, int ties = 1, float p_vis = 0.9f)
-        : type(type), n_kv(n_kv), n_tps(n_tps), n_stream(n_stream), width(width), ties(ties), p_vis(p_vis) {}
+            int n_top = 512, int ties = 1, float p_vis = 0.9f)
+        : type(type), n_kv(n_kv), n_tps(n_tps), n_stream(n_stream), n_top(n_top), ties(ties), p_vis(p_vis) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t n_blocks = n_kv/4 + 1;
@@ -2853,7 +2853,7 @@ struct test_qsa_mask : public test_case {
         ggml_tensor * mask = ggml_new_tensor_4d(ctx, type, n_kv, n_tps, 1, n_stream);
         ggml_set_name(mask, "mask");
 
-        ggml_tensor * out = ggml_qsa_mask(ctx, score, cell_blk, mask, width);
+        ggml_tensor * out = ggml_qsa_mask(ctx, score, cell_blk, mask, n_top);
         ggml_set_name(out, "out");
         return out;
     }
@@ -2871,7 +2871,7 @@ struct test_qsa_mask : public test_case {
                     if (c < 5) {
                         x = -INFINITY;          // a foreign or unused block
                     } else if (c < 7) {
-                        x = 1e9f + x;           // a tail block
+                        x = INFINITY;           // a tail block
                     } else if (c < 8 && ties) {
                         x = -0.0f;              // the ReLU of a negative sum
                     }
@@ -10189,13 +10189,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_qsa_pool(type, 512, 4, 2, GGML_ROPE_TYPE_IMROPE));
         for (int ties : {0, 1, 2}) {
-            test_cases.emplace_back(new test_qsa_mask(type, 4096, 3, 1, 2051, ties, 0.9f));
-            test_cases.emplace_back(new test_qsa_mask(type, 61440, 1, 1, 2051, ties, 0.9f));
-            test_cases.emplace_back(new test_qsa_mask(type, 9000, 70, 2, 2051, ties, 0.5f));
+            test_cases.emplace_back(new test_qsa_mask(type, 4096, 3, 1, 512, ties, 0.9f));
+            test_cases.emplace_back(new test_qsa_mask(type, 61440, 1, 1, 512, ties, 0.9f));
+            test_cases.emplace_back(new test_qsa_mask(type, 9000, 70, 2, 512, ties, 0.5f));
         }
-        test_cases.emplace_back(new test_qsa_mask(type, 1500, 4, 1, 2051, 1, 1.0f));     // keeps every visible cell
-        test_cases.emplace_back(new test_qsa_mask(type, 262144, 2, 1, 2051, 1, 0.3f));
-        test_cases.emplace_back(new test_qsa_mask(type, 4096, 1024, 1, 2051, 1, 0.7f));  // a prefill ubatch
+        test_cases.emplace_back(new test_qsa_mask(type, 1500, 4, 1, 512, 1, 1.0f));     // keeps every visible cell
+        test_cases.emplace_back(new test_qsa_mask(type, 262144, 2, 1, 512, 1, 0.3f));
+        test_cases.emplace_back(new test_qsa_mask(type, 4096, 1024, 1, 512, 1, 0.7f));  // a prefill ubatch
+        test_cases.emplace_back(new test_qsa_mask(type, 4096, 3, 1, 0, 1, 0.9f));       // only the tail
+        test_cases.emplace_back(new test_qsa_mask(type, 4096, 3, 1, 7, 2, 0.9f));       // a cut inside one tie
         test_cases.emplace_back(new test_qsa_pool(type, 512, 2, 1, GGML_ROPE_TYPE_MROPE));
     }
 

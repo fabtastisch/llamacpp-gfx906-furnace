@@ -5482,18 +5482,18 @@ struct ggml_tensor * ggml_qsa_mask(
         struct ggml_tensor  * score,
         struct ggml_tensor  * cell_blk,
         struct ggml_tensor  * kq_mask,
-        int                   width) {
+        int                   n_top) {
     GGML_ASSERT(score->type == GGML_TYPE_F32 && cell_blk->type == GGML_TYPE_I32);
     GGML_ASSERT(kq_mask->type == GGML_TYPE_F16 || kq_mask->type == GGML_TYPE_F32);
     GGML_ASSERT(score->nb[0] == sizeof(float) && cell_blk->nb[0] == sizeof(int32_t) && kq_mask->nb[0] == ggml_type_size(kq_mask->type));
     GGML_ASSERT(kq_mask->ne[2] == 1 && score->ne[3] == 1);
     GGML_ASSERT(cell_blk->ne[0] == kq_mask->ne[0] && score->ne[1] == kq_mask->ne[1]);
     GGML_ASSERT(score->ne[2] == kq_mask->ne[3] && cell_blk->ne[1] == kq_mask->ne[3]);
-    GGML_ASSERT(width > 0);
+    GGML_ASSERT(n_top >= 0);
 
     struct ggml_tensor * result = ggml_new_tensor(ctx, kq_mask->type, GGML_MAX_DIMS, kq_mask->ne);
 
-    ggml_set_op_params_i32(result, 0, width);
+    ggml_set_op_params_i32(result, 0, n_top);
 
     result->op     = GGML_OP_QSA_MASK;
     result->src[0] = score;

@@ -2473,15 +2473,15 @@ extern "C" {
     //   score    F32 [n_blocks, n_tps, n_stream]       biased score of each block for each query
     //   cell_blk I32 [n_kv, n_stream]                  block of each cell
     //   kq_mask  F16/F32 [n_kv, n_tps, 1, n_stream]    the causal/sequence mask, 0 or -INFINITY
-    // cell j of query i is worth score[cell_blk[j], i] + kq_mask[j, i]. The result (kq_mask's type and shape) is 0 at the
-    // `width` most valuable cells (ties in ascending cell index) that kq_mask keeps and -INFINITY elsewhere: the same mask
-    // as expanding the scores to the cells, adding kq_mask, a top-k of `width` and rebuilding the mask from it
+    // for query i a block takes part when kq_mask keeps one of its cells. A block scored +INFINITY (the incomplete tail)
+    // is always kept; of the others the n_top highest scored are kept, ties in ascending block index. The result
+    // (kq_mask's type and shape) is kq_mask at the cells of the kept blocks and -INFINITY elsewhere
     GGML_API struct ggml_tensor * ggml_qsa_mask(
             struct ggml_context * ctx,
             struct ggml_tensor  * score,
             struct ggml_tensor  * cell_blk,
             struct ggml_tensor  * kq_mask,
-            int                   width);
+            int                   n_top);
 
     GGML_API struct ggml_tensor * ggml_arange(
             struct ggml_context * ctx,

@@ -94,7 +94,10 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         self.gguf_writer.add_indexer_top_k(hp["indexer_budget"])
         ratio = hp["indexer_compress_ratio"]
         layer_types = hp["layer_types"]
-        ratios = [ratio if layer_types[i] == "full_attention" else 0 for i in range(n_layer)]
+        # the released config says "full_attention"; transformers renames those layers "qwen_sparse_attention"
+        # on load, so any config it saved again (fine-tunes, later releases) only has the new name
+        sparse = ("full_attention", "qwen_sparse_attention")
+        ratios = [ratio if layer_types[i] in sparse else 0 for i in range(n_layer)]
         # 0 selects dense, which is how the MTP block attends.
         ratios += [0] * (self.block_count - n_layer)
         self.gguf_writer.add_attention_compress_ratios(ratios)
@@ -130,8 +133,10 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
     def _eos_token_id(self) -> int:
         eos = self.hparams.get("eos_token_id")
         if isinstance(eos, list):
-            # the PLE hash resets n-grams on the primary EOS
-            return int(eos[-1])
+            # the PLE hash resets n-grams on the first EOS, as the reference NGramEmbedding does
+            if not eos:
+                raise ValueError("eos_token_id is empty: the PLE hash resets its n-grams on it")
+            return int(eos[0])
         if eos is None:
             raise ValueError("eos_token_id is required: the PLE hash resets its n-grams on it")
         return int(eos)

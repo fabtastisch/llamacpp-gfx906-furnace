@@ -877,11 +877,18 @@ public:
     }
 
     // the indexer scores the cells only when the window holds more than a selection can keep: with fewer, every block
-    // is kept and the attention mask is the KQ mask itself (GGML_OP_QSA_MASK path only)
-    static bool need_scores(int64_t n_kv, uint32_t ratio, uint32_t top_k, bool mask_op) {
+    // is kept and the attention mask is the KQ mask itself (GGML_OP_QSA_MASK path only).
+    // A prompt-sized ubatch scores regardless: the skip changes the graph's node layout, and the first ubatch of a
+    // request (its window is still under the budget) then no longer fits the scheduler's worst-case plan. That
+    // reallocation made the next ubatch wait for the whole pipeline to drain, ~1.1 s per request on a 4-GPU layer
+    // split. With every block kept the scored mask equals the KQ mask, so the result is the same; the scoring of a
+    // window under the budget is small. Decode and verify ubatches keep the skip. LLAMA_QSA_ALWAYS_SCORE=1 scores always
+    static bool need_scores(int64_t n_kv, uint32_t ratio, uint32_t top_k, bool mask_op, uint32_t n_tokens) {
         static const bool always = getenv("LLAMA_QSA_ALWAYS_SCORE") != nullptr;
-        return always || !mask_op || n_kv > max_kept(ratio, top_k);
+        return always || !mask_op || n_kv > max_kept(ratio, top_k) || n_tokens >= QSA_SCORE_MIN_TOKENS;
     }
+
+    static constexpr uint32_t QSA_SCORE_MIN_TOKENS = 64;
 
     void set_input(const llama_ubatch * ubatch) override {
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
@@ -943,7 +950,7 @@ public:
 
         res &= k_idxs->ne[0]    == params.ubatch.n_tokens;
 
-        if (scores != need_scores(n_kv, ratio, top_k, mask_op)) {
+        if (scores != need_scores(n_kv, ratio, top_k, mask_op, params.ubatch.n_tokens)) {
             return false;
         }
         if (!scores) {
@@ -1040,7 +1047,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     if (it != qsa_inps.end()) {
         inp = it->second;
     } else {
-        const bool scores = llm_graph_input_qsa::need_scores(n_kv, (uint32_t) r, hparams.indexer_top_k, mask_op);
+        const bool scores = llm_graph_input_qsa::need_scores(n_kv, (uint32_t) r, hparams.indexer_top_k, mask_op, n_tokens);
         auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias, scores);
         qsa->top_k   = hparams.indexer_top_k;
         qsa->mask_op = mask_op;

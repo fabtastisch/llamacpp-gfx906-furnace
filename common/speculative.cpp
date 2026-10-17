@@ -1686,6 +1686,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
             }
 
+            const int64_t t_h0 = ggml_time_us();
+
             // shift the tgt embeddings to the right by one position
             // assumes that the tokens in the batch are sequential for each sequence
             // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
@@ -1731,6 +1733,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     ++w;
                 }
                 batch.n_tokens = w;
+            }
+
+            if (spec_time_log()) {
+                SPC_INF("catch-up: %d tokens, host copy of the target rows %.1f ms (%.1f MB)\n",
+                        (int) batch.n_tokens, (ggml_time_us() - t_h0) / 1000.0, batch.n_tokens * row_bytes / 1e6);
             }
 
             auto * mem_dft = llama_get_memory(ctx_dft);

@@ -92,6 +92,17 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
             throw std::runtime_error(format("layer %u has compress ratio %u, at most 64 is supported", i, hparams.dsv4_compress_ratios[i]));
         }
     }
+    // LLAMA_MTP_QSA=1: the MTP block attends with QSA at the trunk's ratio, as vLLM and upstream run it (our converter
+    // wrote 0, dense); LLAMA_MTP_QSA=0 forces dense. With QSA the block's indexer tensors are required
+    if (const char * e = getenv("LLAMA_MTP_QSA")) {
+        uint32_t r_trunk = 0;
+        for (uint32_t i = 0; i < hparams.n_layer(); ++i) {
+            r_trunk = std::max(r_trunk, hparams.dsv4_compress_ratios[i]);
+        }
+        for (uint32_t i = hparams.n_layer(); i < hparams.n_layer_all; ++i) {
+            hparams.dsv4_compress_ratios[i] = atoi(e) != 0 ? r_trunk : 0;
+        }
+    }
     ml.get_key(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head,    any_qsa);
     ml.get_key(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size, any_qsa);
     ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k,     any_qsa);
@@ -551,7 +562,32 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     ggml_build_forward_expand(gf, cur);
 }
 
-// TODO: QSA for the draft head; dense is a numerical superset below the 2048-token budget.
+// the write slots of a draft batch that only fills the cache (see kv_only in graph_mtp)
+class llm_graph_input_mtp_kv_store : public llm_graph_input_i {
+public:
+    llm_graph_input_mtp_kv_store(const llama_kv_cache_context * mctx) : mctx(mctx) {}
+    virtual ~llm_graph_input_mtp_kv_store() = default;
+
+    void set_input(const llama_ubatch * ubatch) override {
+        mctx->set_input_k_idxs(k_idxs, ubatch);
+        mctx->set_input_v_idxs(v_idxs, ubatch);
+        if (k_rot) {
+            mctx->set_input_k_rot(k_rot);
+        }
+        if (v_rot) {
+            mctx->set_input_v_rot(v_rot);
+        }
+    }
+
+    ggml_tensor * k_idxs = nullptr;
+    ggml_tensor * v_idxs = nullptr;
+    ggml_tensor * k_rot  = nullptr;
+    ggml_tensor * v_rot  = nullptr;
+
+    const llama_kv_cache_context * mctx;
+};
+
+// the draft head attends with QSA when its block has a compress ratio (LLAMA_MTP_QSA), else densely
 llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params) :
     graph(model, params, no_build_t{}) {
     GGML_ASSERT(hparams.n_layer_nextn > 0 && "QWEN4EXP MTP requires n_layer_nextn > 0");
@@ -601,10 +637,43 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     res->add_input(std::move(inp));
 
-    ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_pos = build_inp_pos();
 
-    auto * inp_attn = build_attn_inp_kv();
+    // QSA: the draft memory is llama_memory_hybrid_idx with no recurrent layer
+    const bool qsa = hparams.dsv4_compress_ratios[il] > 0;
+
+    // a dense batch with no output (the catch-up behind a target prompt or verify batch) only writes its cells' K/V:
+    // a cell's K/V come from the block input alone, and no row needs the attention, FFN or head
+    // LLAMA_MTP_KV_ONLY=0 runs the whole block for them too
+    static const bool kv_only_env = getenv("LLAMA_MTP_KV_ONLY") == nullptr || atoi(getenv("LLAMA_MTP_KV_ONLY")) != 0;
+    const bool kv_only = kv_only_env && !qsa && n_outputs == 0;
+
+    ggml_tensor * inp_out_ids = kv_only ? nullptr : build_inp_out_ids();
+
+    llm_graph_input_attn_kv * inp_attn = nullptr;
+    llm_graph_input_mtp_kv_store * inp_store = nullptr;
+    const llama_memory_hybrid_idx_context * mctx_hyb = nullptr;
+    if (qsa) {
+        auto * inp_hyb = build_inp_mem_hybrid();
+        mctx_hyb = static_cast<const llama_memory_hybrid_idx_context *>(inp_hyb->mctx);
+        GGML_ASSERT(mctx_hyb->get_idx() != nullptr && "QWEN4EXP MTP QSA needs the indexer cache");
+        GGML_ASSERT(mctx_hyb->get_idx()->get_n_kv() == mctx_hyb->get_attn()->get_n_kv() &&
+                mctx_hyb->get_idx()->get_kv_lo() == mctx_hyb->get_attn()->get_kv_lo() &&
+                "the indexer cache must track the attention cache cell for cell");
+        // no layer reads it, but the input still has to be allocated
+        ggml_build_forward_expand(gf, inp_hyb->get_recr()->s_copy);
+        inp_attn = inp_hyb->get_attn();
+    } else if (kv_only) {
+        const auto * mctx_kv = static_cast<const llama_kv_cache_context *>(mctx);
+        auto inp_s = std::make_unique<llm_graph_input_mtp_kv_store>(mctx_kv);
+        inp_s->k_idxs = mctx_kv->build_input_k_idxs(ctx0, ubatch);
+        inp_s->v_idxs = mctx_kv->build_input_v_idxs(ctx0, ubatch);
+        inp_s->k_rot  = mctx_kv->build_input_k_rot(ctx0);
+        inp_s->v_rot  = mctx_kv->build_input_v_rot(ctx0);
+        inp_store = static_cast<llm_graph_input_mtp_kv_store *>(res->add_input(std::move(inp_s)));
+    } else {
+        inp_attn = build_attn_inp_kv();
+    }
 
     ggml_tensor * h_norm = ggml_rms_norm(ctx0, h_state, hparams.f_norm_rms_eps);
     h_norm = ggml_reshape_2d(ctx0, h_norm, hc_dim, n_tokens);
@@ -631,55 +700,89 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
             &inject, il);
     cb(cur, "mtp_hc_attn_pre", il);
 
-    const int64_t n_embd_head = hparams.n_embd_head_v();
-    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
+    if (kv_only) {
+        const int64_t n_embd_head = hparams.n_embd_head_v();
 
-    ggml_tensor * Qcur_full = build_lora_mm(layer.wq, cur, layer.wq_s);
-    cb(Qcur_full, "mtp_Qcur_full", il);
+        ggml_tensor * Kcur = build_lora_mm(layer.wk, cur, layer.wk_s);
+        Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+        Kcur = build_norm(Kcur, layer.attn_k_norm, nullptr, LLM_NORM_RMS, il);
+        Kcur = ggml_rope_multi(ctx0, Kcur, inp_pos, nullptr,
+                n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                ext_factor, attn_factor, beta_fast, beta_slow);
+        cb(Kcur, "mtp_Kcur", il);
 
-    ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
-        ggml_element_size(Qcur_full) * n_embd_head * 2,
-        ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head, 0);
-    Qcur = build_norm(Qcur, layer.attn_q_norm, nullptr, LLM_NORM_RMS, il);
-    cb(Qcur, "mtp_Qcur_normed", il);
+        ggml_tensor * Vcur = build_lora_mm(layer.wv, cur, layer.wv_s);
+        Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+        cb(Vcur, "mtp_Vcur", il);
 
-    ggml_tensor * gate = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
-        ggml_element_size(Qcur_full) * n_embd_head * 2,
-        ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
-        ggml_element_size(Qcur_full) * n_embd_head);
-    gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n_tokens);
-    cb(gate, "mtp_gate", il);
+        // as build_attn: rotate before a quantized cache
+        if (inp_store->k_rot) {
+            Kcur = llama_mul_mat_hadamard(ctx0, Kcur, inp_store->k_rot);
+        }
+        if (inp_store->v_rot) {
+            Vcur = llama_mul_mat_hadamard(ctx0, Vcur, inp_store->v_rot);
+        }
 
-    ggml_tensor * Kcur = build_lora_mm(layer.wk, cur, layer.wk_s);
-    Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
-    Kcur = build_norm(Kcur, layer.attn_k_norm, nullptr, LLM_NORM_RMS, il);
-    cb(Kcur, "mtp_Kcur_normed", il);
+        const auto * mctx_kv = inp_store->mctx;
+        ggml_build_forward_expand(gf, mctx_kv->cpy_k(ctx0, Kcur, inp_store->k_idxs, il));
+        ggml_build_forward_expand(gf, mctx_kv->cpy_v(ctx0, Vcur, inp_store->v_idxs, il));
+        return;
+    }
 
-    ggml_tensor * Vcur = build_lora_mm(layer.wv, cur, layer.wv_s);
-    Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
-    cb(Vcur, "mtp_Vcur", il);
+    if (qsa) {
+        // the same attention as a trunk QSA layer
+        cur = build_layer_attn(inp_attn, mctx_hyb, cur, inp_pos, sections, il);
+    } else {
+        const int64_t n_embd_head = hparams.n_embd_head_v();
+        GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
-    Qcur = ggml_rope_multi(ctx0, Qcur, inp_pos, nullptr,
-            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
-            ext_factor, attn_factor, beta_fast, beta_slow);
-    Kcur = ggml_rope_multi(ctx0, Kcur, inp_pos, nullptr,
-            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
-            ext_factor, attn_factor, beta_fast, beta_slow);
-    cb(Qcur, "mtp_Qcur", il);
-    cb(Kcur, "mtp_Kcur", il);
+        ggml_tensor * Qcur_full = build_lora_mm(layer.wq, cur, layer.wq_s);
+        cb(Qcur_full, "mtp_Qcur_full", il);
 
-    const float kq_scale = hparams.f_attention_scale == 0.0f
-            ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
+        ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
+            ggml_element_size(Qcur_full) * n_embd_head * 2,
+            ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head, 0);
+        Qcur = build_norm(Qcur, layer.attn_q_norm, nullptr, LLM_NORM_RMS, il);
+        cb(Qcur, "mtp_Qcur_normed", il);
 
-    cur = build_attn(inp_attn,
-            nullptr, nullptr, nullptr,
-            Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
-    cb(cur, "mtp_attn_pregate", il);
+        ggml_tensor * gate = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
+            ggml_element_size(Qcur_full) * n_embd_head * 2,
+            ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
+            ggml_element_size(Qcur_full) * n_embd_head);
+        gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n_tokens);
+        cb(gate, "mtp_gate", il);
 
-    cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, gate));
-    cb(cur, "mtp_attn_gated", il);
+        ggml_tensor * Kcur = build_lora_mm(layer.wk, cur, layer.wk_s);
+        Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+        Kcur = build_norm(Kcur, layer.attn_k_norm, nullptr, LLM_NORM_RMS, il);
+        cb(Kcur, "mtp_Kcur_normed", il);
 
-    cur = build_lora_mm(layer.wo, cur, layer.wo_s);
+        ggml_tensor * Vcur = build_lora_mm(layer.wv, cur, layer.wv_s);
+        Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+        cb(Vcur, "mtp_Vcur", il);
+
+        Qcur = ggml_rope_multi(ctx0, Qcur, inp_pos, nullptr,
+                n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                ext_factor, attn_factor, beta_fast, beta_slow);
+        Kcur = ggml_rope_multi(ctx0, Kcur, inp_pos, nullptr,
+                n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                ext_factor, attn_factor, beta_fast, beta_slow);
+        cb(Qcur, "mtp_Qcur", il);
+        cb(Kcur, "mtp_Kcur", il);
+
+        const float kq_scale = hparams.f_attention_scale == 0.0f
+                ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
+
+        cur = build_attn(inp_attn,
+                nullptr, nullptr, nullptr,
+                Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+        cb(cur, "mtp_attn_pregate", il);
+
+        cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, gate));
+        cb(cur, "mtp_attn_gated", il);
+
+        cur = build_lora_mm(layer.wo, cur, layer.wo_s);
+    }
     cb(cur, "mtp_attn_out", il);
 
     if (inp_out_ids) {

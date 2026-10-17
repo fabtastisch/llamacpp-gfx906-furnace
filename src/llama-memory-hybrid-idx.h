@@ -99,6 +99,10 @@ public:
     // Unified caches only; LLAMA_QSA_BLK_CACHE=0 disables it. nullptr when off
     ggml_tensor * get_qsa_blk_k(int32_t il) const;
 
+    // QSA counts block positions from this one: 1 for the qwen4exp MTP draft, whose cache holds no position 0
+    // (cell P pairs token P with the target's state at P - 1), so its blocks group the cells as the reference does
+    void set_qsa_pos_off(uint32_t off) { qsa_pos_off = off; }
+
     struct qsa_blk_plan {
         int     mode = 0;            // 0: pool every block, no cache; 1: pool every block and refresh the cache;
                                      // 2: pool `bids` only (padded to n_re) and score against the cache
@@ -175,6 +179,8 @@ public:
     };
 
 private:
+    uint32_t qsa_pos_off = 0;
+
     mutable std::map<uint32_t, qsa_layout>    qsa_layouts;
     mutable std::map<uint32_t, qsa_layout_ms> qsa_layouts_ms;
 

@@ -372,17 +372,19 @@ llama_kv_cache * llama_memory_hybrid_idx::get_mem_idx() const {
 
 // the cells [lo, lo + n_kv) a ubatch attends, numbered from lo. the cells of sequences outside the ubatch
 // read as empty: every token masks them anyway, and inside a window their positions need not fit it
+// positions are counted from off (llama_memory_hybrid_idx::set_qsa_pos_off); a cell below it reads as empty
 struct qsa_cells {
     const llama_kv_cells &          cells;
     const uint32_t                  lo;
     const llama_kv_cells::seq_set_t vis;
+    const llama_pos                 off;
 
     bool is_empty(int64_t j) const {
-        return cells.is_empty(lo + j) || (cells.seq_get_all(lo + j) & vis).none();
+        return cells.is_empty(lo + j) || (cells.seq_get_all(lo + j) & vis).none() || cells.pos_get(lo + j) < off;
     }
 
     llama_pos pos_get(int64_t j) const {
-        return cells.pos_get(lo + j);
+        return cells.pos_get(lo + j) - off;
     }
 
     const llama_kv_cell_ext & ext_get(int64_t j) const {
@@ -478,8 +480,9 @@ static bool qsa_layout_advance(llama_memory_hybrid_idx::qsa_layout & L, const qs
         L.bid_idx .push_back((int32_t) (pb*r));
         L.bid_cell.push_back(L.grp_first[pb]);
 
+        // rope at the block's first position, not its index
         for (int64_t sec = 0; sec < 4; ++sec) {
-            L.blk_pos[sec*n_blocks + bid] = (int32_t) (pb*r);
+            L.blk_pos[sec*n_blocks + bid] = (int32_t) (pb*r + cells.off);
         }
 
         size_t w = 0;
@@ -612,7 +615,7 @@ static bool qsa_layout_ms_advance(llama_memory_hybrid_idx::qsa_layout_ms & L, co
         L.bid_idx .push_back((int32_t) (pb*r));
         L.bid_cell.push_back(L.grp_first[g]);
         for (int64_t sec = 0; sec < 4; ++sec) {
-            L.blk_pos[sec*n_blocks + bid] = (int32_t) (pb*r);
+            L.blk_pos[sec*n_blocks + bid] = (int32_t) (pb*r + cells.off);
         }
 
         // the other members wait in unpooled; the new cell is not there yet
@@ -709,7 +712,7 @@ void llama_memory_hybrid_idx::set_input_qsa(
     for (int64_t s = 0; s < n_ns; ++s) {
         // ubatch index s*n_tps belongs to this stream; ask which cells array it uses
         const llama_seq_id seq_of_stream = ubatch->seq_id[s*n_tps][0];
-        const qsa_cells cells = { get_mem_idx()->get_cells(seq_of_stream), lo, vis };
+        const qsa_cells cells = { get_mem_idx()->get_cells(seq_of_stream), lo, vis, (llama_pos) qsa_pos_off };
 
         int32_t * cur_cell_blk  = dst_cell_blk  + s*n_kv;
         int32_t * cur_blk_cells = dst_blk_cells + s*(r*n_blocks);
@@ -931,7 +934,14 @@ void llama_memory_hybrid_idx::set_input_qsa(
                 group_cells();
             }
 
-            GGML_ASSERT((!blk_bias || !oor) && "qsa: cell position runs past the cell window");
+            // a cell past the last block (a hole in the cache's positions) goes to the spare block, which is always kept
+            if (oor && blk_bias) {
+                static bool warned = false;
+                if (!warned) {
+                    warned = true;
+                    LLAMA_LOG_WARN("%s: qsa: a cell position runs past the cell window; such cells are always attended\n", __func__);
+                }
+            }
 
             for (int64_t pb = 0; pb < n_blocks; ++pb) {
                 for (int32_t g = grp_head[pb]; g >= 0; g = grp_next[g]) {
@@ -950,11 +960,12 @@ void llama_memory_hybrid_idx::set_input_qsa(
             GGML_ASSERT(n_bid <= n_blocks);
 
             for (int32_t b = 0; b < n_bid; ++b) {
-                int32_t sec_pos[4] = { bid_idx[b], bid_idx[b], bid_idx[b], bid_idx[b] };
+                const int32_t p0 = bid_idx[b] + cells.off;
+                int32_t sec_pos[4] = { p0, p0, p0, p0 };
 
                 if (ranked) {
                     const int32_t   c = bid_slot0[b];
-                    const llama_pos p = cells.pos_get(c);
+                    const llama_pos p = cells.pos_get(c) + cells.off;
                     const auto &    e = cells.ext_get(c);
 
                     sec_pos[0] = p;
@@ -1106,10 +1117,10 @@ void llama_memory_hybrid_idx::set_input_qsa(
             const int64_t      i      = s*n_tps + ii;
             const llama_seq_id seq_id = ubatch->seq_id[i][0];
 
-            int64_t q = ubatch->pos[i];
+            int64_t q = ubatch->pos[i] - cells.off;
 
             if (ranked) {
-                const llama_pos qt = ubatch->pos[i];
+                const llama_pos qt = ubatch->pos[i] - cells.off;
                 const llama_pos qy = ubatch->pos[i + n_tokens];
                 const llama_pos qx = ubatch->pos[i + n_tokens*2];
 
@@ -1336,7 +1347,7 @@ void llama_memory_hybrid_idx::set_input_qsa_re(ggml_tensor * re_cells, ggml_tens
         for (int64_t m = 0; m < r; ++m) {
             d_cells[k*r + m] = blk_cells[b*r + m];
         }
-        const int32_t p = b < (int32_t) bid_idx.size() ? bid_idx[b] : 0;
+        const int32_t p = (b < (int32_t) bid_idx.size() ? bid_idx[b] : 0) + (int32_t) qsa_pos_off;
         for (int64_t sec = 0; sec < 4; ++sec) {
             d_pos[sec*n_re + k] = p;
         }

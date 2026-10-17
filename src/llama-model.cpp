@@ -2538,8 +2538,15 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         default:
             {
                 // Dense MTP heads use a plain attention KV cache instead of the hybrid wrapper.
+                // a qwen4exp MTP block with a compress ratio attends with QSA, so it takes the indexer memory: its
+                // attention and indexer cells, and a recurrent part with no layer
+                const bool mtp_qsa_qwen4exp =
+                    params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_QWEN4EXP &&
+                    hparams.n_layer_nextn > 0 && hparams.indexer_head_size > 0 &&
+                    hparams.dsv4_compress_ratios[hparams.n_layer()] > 0;
+
                 const bool mtp_on_hybrid_qwen =
-                    params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
+                    params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && !mtp_qsa_qwen4exp &&
                     (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE ||
                      arch == LLM_ARCH_BAILINGMOE3 || arch == LLM_ARCH_QWEN4EXP);
 
@@ -2589,6 +2596,12 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 return il < hparams.n_layer() && !hparams.is_recr(il);
                             };
                         }
+
+                        if (mtp_qsa_qwen4exp) {
+                            filter_attn = [&](uint32_t il) { return il >= hparams.n_layer(); };
+                            filter_recr = [&](uint32_t)    { return false; };
+                            filter_idx  = [&](uint32_t il) { return il >= hparams.n_layer(); };
+                        }
                     }
 
                     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
@@ -2613,7 +2626,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* filter_recr       */ std::move(filter_recr));
                     } else if (needs_mem_idx) {
                         // sparse attention over a per-token indexer cache, in its own memory type
-                        res = new llama_memory_hybrid_idx(
+                        auto * mem = new llama_memory_hybrid_idx(
                             /* model             */ *this,
                             /* attn_type_k       */ params.type_k,
                             /* attn_type_v       */ params.type_v,
@@ -2632,6 +2645,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr),
                             /* filter_idx        */ std::move(filter_idx));
+                        // the draft cache holds no position 0: its cell P pairs token P with the target's state at P - 1
+                        if (mtp_qsa_qwen4exp) {
+                            mem->set_qsa_pos_off(1);
+                        }
+                        res = mem;
                     } else {
                         res = new llama_memory_hybrid(
                             /* model             */ *this,

@@ -125,6 +125,12 @@ llama_memory_recurrent::llama_memory_recurrent(
         ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
 
+    // no layer passed the filter (an MTP draft context): there is no state to snapshot
+    if (is_empty() && this->n_rs_seq > 0) {
+        this->n_rs_seq = 0;
+        LLAMA_LOG_INFO("%s: disabling rollback snapshots because the memory module is empty\n", __func__);
+    }
+
     {
         const size_t memory_size_r = size_r_bytes();
         const size_t memory_size_s = size_s_bytes();
@@ -192,6 +198,11 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
 
             // partial rollback via per-token snapshot index (bounded by n_rs_seq)
             if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
+                // no layer, so only the position moves back
+                if (is_empty()) {
+                    cell.pos = p0 - 1;
+                    return true;
+                }
                 const llama_pos rollback = cell.pos - (p0 - 1);
                 // pending rollback is single-use
                 const bool pending = rs_idx[seq_id] != 0;
@@ -716,6 +727,10 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
 bool llama_memory_recurrent::get_can_shift() const {
     // shifting the pos is trivial for recurrent models
     return true;
+}
+
+bool llama_memory_recurrent::is_empty() const {
+    return ctxs_bufs.empty();
 }
 
 size_t llama_memory_recurrent::total_size() const {

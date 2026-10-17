@@ -642,9 +642,13 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
 // graphs whose recurrent range covers other sequences need extra state-copy rows that the worst-case
 // reserve does not have, so any multi-slot decode starts this. Re-plan with the worst-case graph once
 // after such a reallocation. LLAMA_NO_REALLOC_RESTORE=1 disables it.
+// Only a pipelined context drains: elsewhere a reallocation syncs the context's own backends, and the restore
+// itself cost more. The MTP draft's K/V-only catch-up graph never fits the worst-case plan, so every catch-up
+// ubatch restored (~8 ms) and then reallocated again. LLAMA_REALLOC_RESTORE_ALL=1 restores in every context.
 void llama_context::sched_restore_worst_case() {
     static const bool disabled = getenv("LLAMA_NO_REALLOC_RESTORE") != nullptr;
-    if (disabled || !sched || !memory || sched_need_reserve) {
+    static const bool all      = getenv("LLAMA_REALLOC_RESTORE_ALL") != nullptr;
+    if (disabled || !sched || !memory || sched_need_reserve || (!cparams.pipeline_parallel && !all)) {
         return;
     }
 

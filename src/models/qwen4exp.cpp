@@ -882,10 +882,12 @@ public:
     // request (its window is still under the budget) then no longer fits the scheduler's worst-case plan. That
     // reallocation made the next ubatch wait for the whole pipeline to drain, ~1.1 s per request on a 4-GPU layer
     // split. With every block kept the scored mask equals the KQ mask, so the result is the same; the scoring of a
-    // window under the budget is small. Decode and verify ubatches keep the skip. LLAMA_QSA_ALWAYS_SCORE=1 scores always
+    // window under the budget is small. Decode and verify ubatches keep the skip. LLAMA_QSA_ALWAYS_SCORE=1 scores always,
+    // LLAMA_QSA_PROMPT_SCORE=0 skips for prompt ubatches too (the old behaviour)
     static bool need_scores(int64_t n_kv, uint32_t ratio, uint32_t top_k, bool mask_op, uint32_t n_tokens) {
         static const bool always = getenv("LLAMA_QSA_ALWAYS_SCORE") != nullptr;
-        return always || !mask_op || n_kv > max_kept(ratio, top_k) || n_tokens >= QSA_SCORE_MIN_TOKENS;
+        static const bool prompt = [] { const char * e = getenv("LLAMA_QSA_PROMPT_SCORE"); return !e || atoi(e) != 0; }();
+        return always || !mask_op || n_kv > max_kept(ratio, top_k) || (prompt && n_tokens >= QSA_SCORE_MIN_TOKENS);
     }
 
     static constexpr uint32_t QSA_SCORE_MIN_TOKENS = 64;

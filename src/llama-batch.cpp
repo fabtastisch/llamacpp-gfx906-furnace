@@ -755,7 +755,16 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
 
     udata->batch_idxs = idxs;
 
-    const int64_t n_embd_all = batch.embd ? (int64_t) n_tokens*n_embd : 0;
+    // embeddings of consecutive batch rows are read in place from the caller's batch, which stays valid for the
+    // whole decode, instead of being copied: an MTP catch-up row is 40 KB, and the copy into a fresh zero-filled
+    // vector ran at ~1.2 GB/s (~460 ms for a 13.6K-token batch). LLAMA_UBATCH_EMBD_COPY=1 keeps the copy.
+    static const bool embd_copy = getenv("LLAMA_UBATCH_EMBD_COPY") != nullptr;
+    bool embd_view = batch.embd != nullptr && !embd_copy;
+    for (size_t i = 1; embd_view && i < idxs.size(); ++i) {
+        embd_view = idxs[i] == idxs[0] + (int32_t) i;
+    }
+
+    const int64_t n_embd_all = batch.embd && !embd_view ? (int64_t) n_tokens*n_embd : 0;
     const int64_t n_pos_all  =              (int64_t) n_tokens*n_pos_per_embd;
 
     udata->token     .resize(n_tokens);
@@ -776,7 +785,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
             udata->token[i] = batch.token[idxs[i]];
         }
 
-        if (batch.embd) {
+        if (batch.embd && !embd_view) {
             memcpy(udata->embd.data() + i*n_embd, batch.embd + (int64_t) idxs[i]*n_embd, n_embd*sizeof(float));
         }
 
@@ -826,7 +835,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         /*.n_pos        =*/ n_pos_per_embd,
 
         /*.token        =*/ batch.token ? udata->token.data() : nullptr,
-        /*.embd         =*/ batch.embd ? udata->embd.data() : nullptr,
+        /*.embd         =*/ !batch.embd ? nullptr : embd_view ? batch.embd + (int64_t) idxs[0]*n_embd : udata->embd.data(),
         /*.pos          =*/ udata->pos.data(),
         /*.n_seq_id     =*/ udata->n_seq_id.data(),
         /*.seq_id       =*/ udata->seq_id.data(),

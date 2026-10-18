@@ -101,6 +101,8 @@ struct llama_context {
     // one before it waits only for the event its rows were recorded behind, older rows are gone (NULL)
     float * get_embeddings_nextn_for(uint32_t decode_no);
 
+    bool has_embeddings_nextn_spare_row() const { return embd_nextn.data != nullptr && !cparams.embeddings_nextn_masked; }
+
     float * get_embeddings_layer_inp(uint32_t lid);
 
     llama_token * get_sampled_tokens() const;

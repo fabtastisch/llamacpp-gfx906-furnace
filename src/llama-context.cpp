@@ -1081,7 +1081,8 @@ float * llama_context::embd_nextn_base(uint32_t decode_no) {
         return embd_nextn.data;
     }
 
-    return embd_nextn.data + (size_t) (decode_no & 1) * cparams.n_batch * model.hparams.n_embd_out();
+    // each half is [spare row][n_batch rows]: a reader may write the spare row (see llama_get_embeddings_nextn_for)
+    return embd_nextn.data + ((size_t) (decode_no & 1) * (cparams.n_batch + 1) + 1) * model.hparams.n_embd_out();
 }
 
 float * llama_context::get_embeddings_nextn() {
@@ -1123,7 +1124,7 @@ void llama_context::nextn_reorder(int half) {
     }
 
     const size_t n_embd = model.hparams.n_embd_out();
-    float * base = embd_nextn.data + (size_t) half * cparams.n_batch * n_embd;
+    float * base = embd_nextn_base(half);
 
     // row i holds batch index idxs[i]: swap it to its place until row i holds batch index i (after upstream 4453b535f)
     for (size_t i = 0; i < idxs.size(); ++i) {
@@ -1806,7 +1807,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
 
         const uint32_t n_embd = hparams.n_embd_out();
         GGML_ASSERT(n_tokens*n_embd <= (int64_t) embd_nextn.size);
-        ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn.data, 0, n_tokens*n_embd*sizeof(float));
+        ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_base(n_decodes), 0, n_tokens*n_embd*sizeof(float));
     }
 
     // TODO: hacky solution
@@ -2452,8 +2453,8 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     if (has_embd_nextn && !cparams.embeddings_nextn_masked) {
         // unmasked: nextn row exists for every token in the batch, not just
         // those flagged via batch.logits[i] -> size by token count instead.
-        // two halves, selected by decode parity (see embd_nextn_base)
-        embd_nextn.size = (size_t) 2 * n_embd_out * n_batch;
+        // two halves, selected by decode parity, each behind one spare row (see embd_nextn_base)
+        embd_nextn.size = (size_t) 2 * n_embd_out * (n_batch + 1);
     }
 
     for (bool enabled : cparams.embeddings_layer_inp) {
@@ -4448,6 +4449,10 @@ uint32_t llama_get_n_decodes(const llama_context * ctx) {
 
 float * llama_get_embeddings_nextn_for(llama_context * ctx, uint32_t decode_no) {
     return ctx->get_embeddings_nextn_for(decode_no);
+}
+
+bool llama_embeddings_nextn_has_spare_row(const llama_context * ctx) {
+    return ctx->has_embeddings_nextn_spare_row();
 }
 
 float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {

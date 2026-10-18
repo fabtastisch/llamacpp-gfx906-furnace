@@ -1688,62 +1688,94 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             const int64_t t_h0 = ggml_time_us();
 
-            // shift the tgt embeddings to the right by one position
-            // assumes that the tokens in the batch are sequential for each sequence
-            // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
-            //                                                       ^--- this is a problem
-            // TODO:this is generally true, but would be nice to assert it
-            if (n_tokens > 1) {
-                std::memcpy(batch.embd + (size_t) 1 * n_embd, h_row(0), row_bytes * (n_tokens-1));
-            }
-
-            // fill the pending embeddings from a previous run
-            auto set_h = [&](int idx, const float * h_row) {
-                std::memcpy(batch.embd + (size_t) idx * n_embd, h_row, row_bytes);
-            };
-
-            bool any_hole = false;
+            // one sequence filling the batch (a prompt chunk): read the target rows in place, the carried-over
+            // row goes in the spare row in front of them (LLAMA_MTP_ROWS_COPY=1: copy them as below)
+            static const bool rows_copy = getenv("LLAMA_MTP_ROWS_COPY") != nullptr;
+            int32_t n_seq_in = 0;
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                if (i_batch_beg[seq_id] < 0) {
-                    continue;
-                }
-
-                if (pending_pos[seq_id] >= 0 && pending_pos[seq_id] + 1 == batch_in.pos[i_batch_beg[seq_id]]) {
-                    set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
-                } else {
-                    batch.logits[i_batch_beg[seq_id]] = -1; // marks the hole, compacted below
-                    any_hole = true;
-                }
+                n_seq_in += i_batch_beg[seq_id] >= 0;
             }
+            const llama_seq_id seq0 = batch_in.seq_id[0][0];
+            llama_batch batch_dft = batch;
+            const bool in_place = !rows_copy && n_tokens > 1 && n_seq_in == 1 &&
+                                  i_batch_beg[seq0] == 0 && i_batch_end[seq0] == n_tokens - 1 &&
+                                  llama_embeddings_nextn_has_spare_row(this->params.ctx_tgt);
+            if (in_place) {
+                float * h0 = const_cast<float *>(h_row(0));
+                if (pending_pos[seq0] >= 0 && pending_pos[seq0] + 1 == batch_in.pos[0]) {
+                    std::memcpy(h0 - n_embd, pending_h[seq0].data(), row_bytes);
+                    batch_dft.embd = h0 - n_embd;
+                } else {
+                    // no carried-over row: drop the first token, the rest line up with the target rows
+                    batch_dft.n_tokens -= 1;
+                    batch_dft.token    += 1;
+                    batch_dft.pos      += 1;
+                    batch_dft.n_seq_id += 1;
+                    batch_dft.seq_id   += 1;
+                    batch_dft.logits   += 1;
+                    batch_dft.embd      = h0;
+                }
+            } else {
 
-            if (any_hole) {
-                int32_t w = 0;
-                for (int32_t k = 0; k < batch.n_tokens; ++k) {
-                    if (batch.logits[k] == -1) {
+                // shift the tgt embeddings to the right by one position
+                // assumes that the tokens in the batch are sequential for each sequence
+                // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
+                //                                                       ^--- this is a problem
+                // TODO:this is generally true, but would be nice to assert it
+                if (n_tokens > 1) {
+                    std::memcpy(batch.embd + (size_t) 1 * n_embd, h_row(0), row_bytes * (n_tokens-1));
+                }
+
+                // fill the pending embeddings from a previous run
+                auto set_h = [&](int idx, const float * h_row) {
+                    std::memcpy(batch.embd + (size_t) idx * n_embd, h_row, row_bytes);
+                };
+
+                bool any_hole = false;
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    if (i_batch_beg[seq_id] < 0) {
                         continue;
                     }
-                    if (w != k) {
-                        batch.token[w]     = batch.token[k];
-                        batch.pos[w]       = batch.pos[k];
-                        batch.n_seq_id[w]  = batch.n_seq_id[k];
-                        batch.seq_id[w][0] = batch.seq_id[k][0];
-                        batch.logits[w]    = batch.logits[k];
-                        std::memmove(batch.embd + (size_t) w * n_embd, batch.embd + (size_t) k * n_embd, row_bytes);
+
+                    if (pending_pos[seq_id] >= 0 && pending_pos[seq_id] + 1 == batch_in.pos[i_batch_beg[seq_id]]) {
+                        set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
+                    } else {
+                        batch.logits[i_batch_beg[seq_id]] = -1; // marks the hole, compacted below
+                        any_hole = true;
                     }
-                    ++w;
                 }
-                batch.n_tokens = w;
+
+                if (any_hole) {
+                    int32_t w = 0;
+                    for (int32_t k = 0; k < batch.n_tokens; ++k) {
+                        if (batch.logits[k] == -1) {
+                            continue;
+                        }
+                        if (w != k) {
+                            batch.token[w]     = batch.token[k];
+                            batch.pos[w]       = batch.pos[k];
+                            batch.n_seq_id[w]  = batch.n_seq_id[k];
+                            batch.seq_id[w][0] = batch.seq_id[k][0];
+                            batch.logits[w]    = batch.logits[k];
+                            std::memmove(batch.embd + (size_t) w * n_embd, batch.embd + (size_t) k * n_embd, row_bytes);
+                        }
+                        ++w;
+                    }
+                    batch.n_tokens = w;
+                }
+
+                batch_dft = batch;
             }
 
             if (spec_time_log()) {
-                SPC_INF("catch-up: %d tokens, host copy of the target rows %.1f ms (%.1f MB)\n",
-                        (int) batch.n_tokens, (ggml_time_us() - t_h0) / 1000.0, batch.n_tokens * row_bytes / 1e6);
+                SPC_INF("catch-up: %d tokens, %s of the target rows %.1f ms (%.1f MB)\n", (int) batch_dft.n_tokens,
+                        in_place ? "in place" : "host copy", (ggml_time_us() - t_h0) / 1000.0, batch_dft.n_tokens * row_bytes / 1e6);
             }
 
             auto * mem_dft = llama_get_memory(ctx_dft);
 
             bool ok = true;
-            for (int head = 0; head < n_mtp_layers && batch.n_tokens > 0; ++head) {
+            for (int head = 0; head < n_mtp_layers && batch_dft.n_tokens > 0; ++head) {
                 if (chain_heads) {
                     // ref: https://github.com/ggml-org/llama.cpp/pull/24340/changes#r3413498544
                     for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -1756,12 +1788,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
 
                 const int64_t t_dec0 = ggml_time_us();
-                const int32_t rc = llama_decode(ctx_dft, batch);
+                const int32_t rc = llama_decode(ctx_dft, batch_dft);
                 if (spec_time_log()) {
                     const int64_t t_dec1 = ggml_time_us();
                     llama_synchronize(ctx_dft);
                     SPC_INF("catch-up: %d tokens, decode call %.1f ms, done %.1f ms\n",
-                            (int) batch.n_tokens, (t_dec1 - t_dec0) / 1000.0, (ggml_time_us() - t_dec0) / 1000.0);
+                            (int) batch_dft.n_tokens, (t_dec1 - t_dec0) / 1000.0, (ggml_time_us() - t_dec0) / 1000.0);
                 }
                 if (rc != 0) {
                     SPC_ERR("llama_decode(ctx_dft) head=%d failed rc=%d (pos=%d)\n",

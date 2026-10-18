@@ -115,6 +115,11 @@ LLAMA_API uint32_t llama_get_n_decodes(const struct llama_context * ctx);
 // rows, so the caller can read them while the next decode is still running. Older rows are gone: NULL.
 LLAMA_API float * llama_get_embeddings_nextn_for(struct llama_context * ctx, uint32_t decode_no);
 
+// Unmasked nextn rows (llama_get_embeddings_nextn, _for, _ith) sit one row past a spare row the caller may
+// write, valid as long as the rows are: a reader can put a row of its own in front of them and use row -1..n-1
+// in place (MTP's catch-up batch is the target's rows shifted by one behind the carried-over row).
+LLAMA_API bool llama_embeddings_nextn_has_spare_row(const struct llama_context * ctx);
+
 // Set whether the context outputs the input embeddings of a specific layer
 LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
 

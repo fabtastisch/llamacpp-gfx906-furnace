@@ -103,6 +103,8 @@ struct llama_context {
 
     bool has_embeddings_nextn_spare_row() const { return embd_nextn.data != nullptr && !cparams.embeddings_nextn_masked; }
 
+    void set_ubatch_callback(llama_ubatch_callback cb, void * user_data) { ubatch_cb = cb; ubatch_cb_data = user_data; }
+
     float * get_embeddings_layer_inp(uint32_t lid);
 
     llama_token * get_sampled_tokens() const;
@@ -336,6 +338,9 @@ private:
 
     // nextn rows carried across an output buffer reallocation
     std::vector<float> embd_nextn_keep;
+
+    llama_ubatch_callback ubatch_cb      = nullptr;
+    void *                ubatch_cb_data = nullptr;
 
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true

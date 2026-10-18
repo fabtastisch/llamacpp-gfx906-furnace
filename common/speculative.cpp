@@ -1528,9 +1528,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         verify_h.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
+
+        cu.pos_beg.assign(n_seq, -1);
+
+        // LLAMA_MTP_OVERLAP=0: run a postponed catch-up only at the next process/draft call;
+        // LLAMA_MTP_OVERLAP_START: the target ubatch (1-based) from which it may run during the next decode
+        if (!getenv("LLAMA_MTP_OVERLAP") || atoi(getenv("LLAMA_MTP_OVERLAP")) != 0) {
+            if (getenv("LLAMA_MTP_OVERLAP_START")) {
+                overlap_start = std::max(1, atoi(getenv("LLAMA_MTP_OVERLAP_START")));
+            }
+            llama_set_ubatch_callback(ctx_tgt, on_target_ubatch, this);
+        }
     }
 
     ~common_speculative_impl_draft_mtp() override {
+        llama_set_ubatch_callback(this->params.ctx_tgt, nullptr, nullptr);
+
         auto * ctx_dft = this->params.ctx_dft;
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
             if (backend_chains[seq_id] == nullptr) {
@@ -1612,49 +1625,122 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
         has_deferred = false;
 
+        if (!cu.active && !cu_prepare_deferred("flush")) {
+            return;
+        }
+        if (!cu_run(INT32_MAX)) {
+            SPC_ERR("%s", "deferred process() failed\n");
+        }
+        cu_finish(deferred);
+    }
+
+    bool cu_prepare_deferred(const char * who) {
         // waits for the deferred batch's decode only; a decode enqueued since keeps running
         const int64_t t_wait0 = ggml_time_us();
         const float * h_tgt = llama_get_embeddings_nextn_for(this->params.ctx_tgt, deferred_no);
         if (spec_time_log()) {
-            SPC_INF("flush: waited %.1f ms for target decode %u (%d tokens)\n",
-                    (ggml_time_us() - t_wait0) / 1000.0, deferred_no, deferred.n_tokens);
+            SPC_INF("%s: waited %.1f ms for target decode %u (%d tokens)\n",
+                    who, (ggml_time_us() - t_wait0) / 1000.0, deferred_no, deferred.n_tokens);
         }
         if (h_tgt == nullptr) {
             SPC_ERR("nextn rows of target decode %u are no longer available (n_decodes = %u)\n",
                     deferred_no, llama_get_n_decodes(this->params.ctx_tgt));
             GGML_ABORT("deferred MTP batch lost its target outputs");
         }
+        return cu_prepare(deferred, h_tgt);
+    }
 
-        if (!process_impl(deferred, h_tgt)) {
+    // the next target decode calls this after each of its ubatches: the host waits there for the
+    // pipeline anyway, so the postponed catch-up runs in pieces, paced to end with that decode. From
+    // ubatch overlap_start on (with 4 pipeline copies, enqueueing ubatch 4 of the next decode means the
+    // deferred decode's rows have landed, so the event wait in cu_prepare_deferred does not stall)
+    int32_t overlap_start = 5;
+
+    static void on_target_ubatch(void * user_data, int32_t i_ubatch, int32_t n_done, int32_t n_all) {
+        static_cast<common_speculative_impl_draft_mtp *>(user_data)->overlap_step(i_ubatch, n_done, n_all);
+    }
+
+    void overlap_step(int32_t i_ubatch, int32_t n_done, int32_t n_all) {
+        if (!has_deferred || i_ubatch + 1 < overlap_start) {
+            return;
+        }
+        if (!cu.active && !cu_prepare_deferred("overlap")) {
+            has_deferred = false;
+            return;
+        }
+        const int32_t rem = cu.b.n_tokens - cu.done;
+        if (!cu.split_ok || rem <= 0) {
+            return;
+        }
+
+        // this call and one per target ubatch still to come share what is left
+        const int32_t avg   = std::max(1, n_done / (i_ubatch + 1));
+        const int32_t calls = 1 + (n_all - n_done + avg - 1) / avg;
+
+        const int64_t t0 = ggml_time_us();
+        const int32_t done0 = cu.done;
+        if (!cu_run((rem + calls - 1) / calls)) {
             SPC_ERR("%s", "deferred process() failed\n");
+        }
+        if (spec_time_log()) {
+            SPC_INF("overlap: target ubatch %d (%d/%d tokens): catch-up %d -> %d of %d tokens, %.1f ms\n",
+                    i_ubatch, n_done, n_all, done0, cu.done, cu.b.n_tokens, (ggml_time_us() - t0) / 1000.0);
         }
     }
 
     // h_tgt: the target's nextn rows for batch_in, dense by batch position; NULL fetches the latest
     bool process_impl(const llama_batch & batch_in, const float * h_tgt) {
-        if (batch_in.n_tokens <= 0) {
+        if (!cu_prepare(batch_in, h_tgt)) {
             return true;
+        }
+        const bool ok = cu_run(INT32_MAX);
+        cu_finish(batch_in);
+        return ok;
+    }
+
+    // one catch-up in three steps, so a postponed one can run in pieces during the next target decode:
+    // cu_prepare builds the draft batch, cu_run decodes up to n tokens of it, cu_finish keeps the rows the
+    // next batch and accept() need
+    struct {
+        bool          active    = false;
+        bool          split_ok  = false;   // may run in pieces (one sequence, rows in place, a single head)
+        bool          has_output = false;
+        llama_batch   b         = {};      // the draft batch (a view of `batch`, possibly of the target's rows)
+        int32_t       done      = 0;       // tokens of b decoded
+        const float * h_tgt     = nullptr;
+        std::vector<llama_pos> pos_beg;    // first position of each sequence in the batch
+    } cu;
+
+    const float * cu_h_row(int32_t i) {
+        if (cu.h_tgt == nullptr) {
+            cu.h_tgt = llama_get_embeddings_nextn(this->params.ctx_tgt);
+        }
+        return cu.h_tgt + (size_t) i * n_embd;
+    }
+
+    // false: nothing to do for this batch
+    bool cu_prepare(const llama_batch & batch_in, const float * h_tgt) {
+        if (batch_in.n_tokens <= 0) {
+            return false;
         }
 
         // TODO: how to make it work with vision tokens?
         if (batch_in.token == nullptr || batch_in.embd != nullptr) {
-            return true;
+            return false;
         }
 
         const int32_t n_tokens = batch_in.n_tokens;
 
-        auto h_row = [&](int32_t i) {
-            if (h_tgt == nullptr) {
-                h_tgt = llama_get_embeddings_nextn(this->params.ctx_tgt);
-            }
-            return h_tgt + (size_t) i * n_embd;
-        };
+        cu.active   = true;
+        cu.split_ok = false;
+        cu.done     = 0;
+        cu.h_tgt    = h_tgt;
 
         // verify_h feeds accept(), which only follows a decode that produced outputs; a prompt batch
         // without outputs only needs the carry-over row
-        bool has_output = false;
+        cu.has_output = false;
         for (int32_t k = 0; k < n_tokens && batch_in.logits != nullptr; ++k) {
-            has_output |= batch_in.logits[k] != 0;
+            cu.has_output |= batch_in.logits[k] != 0;
         }
 
         // remember the first and last batch index for each sequence
@@ -1669,147 +1755,188 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     i_batch_end[seq_id] = k;
                     if (i_batch_beg[seq_id] < 0) {
                         i_batch_beg[seq_id] = k;
+                        cu.pos_beg[seq_id]  = batch_in.pos[k];
                     }
                 }
             }
         }
 
-        auto * ctx_dft = this->params.ctx_dft;
-
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
+        cu.b = batch;
+        cu.b.n_tokens = 0;
+
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
-        if (!is_mem_shared) {
-            common_batch_clear(batch);
+        if (is_mem_shared) {
+            return true;
+        }
 
-            for (int k = 0; k < n_tokens; ++k) {
-                common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
-            }
+        common_batch_clear(batch);
 
-            const int64_t t_h0 = ggml_time_us();
+        for (int k = 0; k < n_tokens; ++k) {
+            common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
+        }
 
-            // one sequence filling the batch (a prompt chunk): read the target rows in place, the carried-over
-            // row goes in the spare row in front of them (LLAMA_MTP_ROWS_COPY=1: copy them as below)
-            static const bool rows_copy = getenv("LLAMA_MTP_ROWS_COPY") != nullptr;
-            int32_t n_seq_in = 0;
-            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                n_seq_in += i_batch_beg[seq_id] >= 0;
-            }
-            const llama_seq_id seq0 = batch_in.seq_id[0][0];
-            llama_batch batch_dft = batch;
-            const bool in_place = !rows_copy && n_tokens > 1 && n_seq_in == 1 &&
-                                  i_batch_beg[seq0] == 0 && i_batch_end[seq0] == n_tokens - 1 &&
-                                  llama_embeddings_nextn_has_spare_row(this->params.ctx_tgt);
-            if (in_place) {
-                float * h0 = const_cast<float *>(h_row(0));
-                if (pending_pos[seq0] >= 0 && pending_pos[seq0] + 1 == batch_in.pos[0]) {
-                    std::memcpy(h0 - n_embd, pending_h[seq0].data(), row_bytes);
-                    batch_dft.embd = h0 - n_embd;
-                } else {
-                    // no carried-over row: drop the first token, the rest line up with the target rows
-                    batch_dft.n_tokens -= 1;
-                    batch_dft.token    += 1;
-                    batch_dft.pos      += 1;
-                    batch_dft.n_seq_id += 1;
-                    batch_dft.seq_id   += 1;
-                    batch_dft.logits   += 1;
-                    batch_dft.embd      = h0;
-                }
+        const int64_t t_h0 = ggml_time_us();
+
+        // one sequence filling the batch (a prompt chunk): read the target rows in place, the carried-over
+        // row goes in the spare row in front of them (LLAMA_MTP_ROWS_COPY=1: copy them as below)
+        static const bool rows_copy = getenv("LLAMA_MTP_ROWS_COPY") != nullptr;
+        int32_t n_seq_in = 0;
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            n_seq_in += i_batch_beg[seq_id] >= 0;
+        }
+        const llama_seq_id seq0 = batch_in.seq_id[0][0];
+        llama_batch & batch_dft = cu.b;
+        batch_dft = batch;
+        const bool in_place = !rows_copy && n_tokens > 1 && n_seq_in == 1 &&
+                              i_batch_beg[seq0] == 0 && i_batch_end[seq0] == n_tokens - 1 &&
+                              llama_embeddings_nextn_has_spare_row(this->params.ctx_tgt);
+        if (in_place) {
+            float * h0 = const_cast<float *>(cu_h_row(0));
+            if (pending_pos[seq0] >= 0 && pending_pos[seq0] + 1 == batch_in.pos[0]) {
+                std::memcpy(h0 - n_embd, pending_h[seq0].data(), row_bytes);
+                batch_dft.embd = h0 - n_embd;
             } else {
+                // no carried-over row: drop the first token, the rest line up with the target rows
+                batch_dft.n_tokens -= 1;
+                batch_dft.token    += 1;
+                batch_dft.pos      += 1;
+                batch_dft.n_seq_id += 1;
+                batch_dft.seq_id   += 1;
+                batch_dft.logits   += 1;
+                batch_dft.embd      = h0;
+            }
+            cu.split_ok = !chain_heads;
+        } else {
+            // shift the tgt embeddings to the right by one position
+            // assumes that the tokens in the batch are sequential for each sequence
+            // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
+            //                                                       ^--- this is a problem
+            // TODO:this is generally true, but would be nice to assert it
+            if (n_tokens > 1) {
+                std::memcpy(batch.embd + (size_t) 1 * n_embd, cu_h_row(0), row_bytes * (n_tokens-1));
+            }
 
-                // shift the tgt embeddings to the right by one position
-                // assumes that the tokens in the batch are sequential for each sequence
-                // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
-                //                                                       ^--- this is a problem
-                // TODO:this is generally true, but would be nice to assert it
-                if (n_tokens > 1) {
-                    std::memcpy(batch.embd + (size_t) 1 * n_embd, h_row(0), row_bytes * (n_tokens-1));
+            // fill the pending embeddings from a previous run
+            auto set_h = [&](int idx, const float * h_row) {
+                std::memcpy(batch.embd + (size_t) idx * n_embd, h_row, row_bytes);
+            };
+
+            bool any_hole = false;
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (i_batch_beg[seq_id] < 0) {
+                    continue;
                 }
 
-                // fill the pending embeddings from a previous run
-                auto set_h = [&](int idx, const float * h_row) {
-                    std::memcpy(batch.embd + (size_t) idx * n_embd, h_row, row_bytes);
-                };
+                if (pending_pos[seq_id] >= 0 && pending_pos[seq_id] + 1 == batch_in.pos[i_batch_beg[seq_id]]) {
+                    set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
+                } else {
+                    batch.logits[i_batch_beg[seq_id]] = -1; // marks the hole, compacted below
+                    any_hole = true;
+                }
+            }
 
-                bool any_hole = false;
+            if (any_hole) {
+                int32_t w = 0;
+                for (int32_t k = 0; k < batch.n_tokens; ++k) {
+                    if (batch.logits[k] == -1) {
+                        continue;
+                    }
+                    if (w != k) {
+                        batch.token[w]     = batch.token[k];
+                        batch.pos[w]       = batch.pos[k];
+                        batch.n_seq_id[w]  = batch.n_seq_id[k];
+                        batch.seq_id[w][0] = batch.seq_id[k][0];
+                        batch.logits[w]    = batch.logits[k];
+                        std::memmove(batch.embd + (size_t) w * n_embd, batch.embd + (size_t) k * n_embd, row_bytes);
+                    }
+                    ++w;
+                }
+                batch.n_tokens = w;
+            }
+
+            batch_dft = batch;
+        }
+
+        if (spec_time_log()) {
+            SPC_INF("catch-up: %d tokens, %s of the target rows %.1f ms (%.1f MB)\n", (int) batch_dft.n_tokens,
+                    in_place ? "in place" : "host copy", (ggml_time_us() - t_h0) / 1000.0, batch_dft.n_tokens * row_bytes / 1e6);
+        }
+
+        return true;
+    }
+
+    // decode up to n_max more tokens of the prepared batch, whole draft ubatches at a time (all of it unless
+    // split_ok); every head runs over the whole batch when they are chained
+    bool cu_run(int32_t n_max) {
+        auto * ctx_dft = this->params.ctx_dft;
+        llama_batch & batch_dft = cu.b;
+
+        int32_t n = batch_dft.n_tokens - cu.done;
+        if (cu.split_ok && n > n_max) {
+            const int32_t n_ub = (int32_t) llama_n_ubatch(ctx_dft);
+            n = std::min(n, (n_max + n_ub - 1) / n_ub * n_ub);
+        }
+        if (n <= 0) {
+            return true;
+        }
+
+        llama_batch view = batch_dft;
+        view.n_tokens  = n;
+        view.token    += cu.done;
+        view.pos      += cu.done;
+        view.n_seq_id += cu.done;
+        view.seq_id   += cu.done;
+        view.logits   += cu.done;
+        view.embd     += (size_t) cu.done * n_embd;
+
+        auto * mem_dft = llama_get_memory(ctx_dft);
+
+        bool ok = true;
+        for (int head = 0; head < n_mtp_layers; ++head) {
+            if (chain_heads) {
+                // ref: https://github.com/ggml-org/llama.cpp/pull/24340/changes#r3413498544
                 for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                     if (i_batch_beg[seq_id] < 0) {
                         continue;
                     }
-
-                    if (pending_pos[seq_id] >= 0 && pending_pos[seq_id] + 1 == batch_in.pos[i_batch_beg[seq_id]]) {
-                        set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
-                    } else {
-                        batch.logits[i_batch_beg[seq_id]] = -1; // marks the hole, compacted below
-                        any_hole = true;
-                    }
+                    llama_memory_seq_rm(mem_dft, seq_id, cu.pos_beg[seq_id], -1);
                 }
-
-                if (any_hole) {
-                    int32_t w = 0;
-                    for (int32_t k = 0; k < batch.n_tokens; ++k) {
-                        if (batch.logits[k] == -1) {
-                            continue;
-                        }
-                        if (w != k) {
-                            batch.token[w]     = batch.token[k];
-                            batch.pos[w]       = batch.pos[k];
-                            batch.n_seq_id[w]  = batch.n_seq_id[k];
-                            batch.seq_id[w][0] = batch.seq_id[k][0];
-                            batch.logits[w]    = batch.logits[k];
-                            std::memmove(batch.embd + (size_t) w * n_embd, batch.embd + (size_t) k * n_embd, row_bytes);
-                        }
-                        ++w;
-                    }
-                    batch.n_tokens = w;
-                }
-
-                batch_dft = batch;
+                llama_set_nextn_layer_offset(ctx_dft, head);
             }
 
+            const int64_t t_dec0 = ggml_time_us();
+            const int32_t rc = llama_decode(ctx_dft, view);
             if (spec_time_log()) {
-                SPC_INF("catch-up: %d tokens, %s of the target rows %.1f ms (%.1f MB)\n", (int) batch_dft.n_tokens,
-                        in_place ? "in place" : "host copy", (ggml_time_us() - t_h0) / 1000.0, batch_dft.n_tokens * row_bytes / 1e6);
+                const int64_t t_dec1 = ggml_time_us();
+                llama_synchronize(ctx_dft);
+                SPC_INF("catch-up: %d of %d tokens from %d, decode call %.1f ms, done %.1f ms\n",
+                        (int) view.n_tokens, (int) batch_dft.n_tokens, (int) cu.done, (t_dec1 - t_dec0) / 1000.0, (ggml_time_us() - t_dec0) / 1000.0);
             }
-
-            auto * mem_dft = llama_get_memory(ctx_dft);
-
-            bool ok = true;
-            for (int head = 0; head < n_mtp_layers && batch_dft.n_tokens > 0; ++head) {
-                if (chain_heads) {
-                    // ref: https://github.com/ggml-org/llama.cpp/pull/24340/changes#r3413498544
-                    for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                        if (i_batch_beg[seq_id] < 0) {
-                            continue;
-                        }
-                        llama_memory_seq_rm(mem_dft, seq_id, batch_in.pos[i_batch_beg[seq_id]], -1);
-                    }
-                    llama_set_nextn_layer_offset(ctx_dft, head);
-                }
-
-                const int64_t t_dec0 = ggml_time_us();
-                const int32_t rc = llama_decode(ctx_dft, batch_dft);
-                if (spec_time_log()) {
-                    const int64_t t_dec1 = ggml_time_us();
-                    llama_synchronize(ctx_dft);
-                    SPC_INF("catch-up: %d tokens, decode call %.1f ms, done %.1f ms\n",
-                            (int) batch_dft.n_tokens, (t_dec1 - t_dec0) / 1000.0, (ggml_time_us() - t_dec0) / 1000.0);
-                }
-                if (rc != 0) {
-                    SPC_ERR("llama_decode(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
-                            head, (int) rc, (int) batch_in.pos[0]);
-                    ok = false;
-                    break;
-                }
+            if (rc != 0) {
+                SPC_ERR("llama_decode(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
+                        head, (int) rc, (int) view.pos[0]);
+                ok = false;
+                break;
             }
-
-            if (chain_heads) {
-                llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
-            }
-            if (!ok) {
-                return false;
+            if (!chain_heads) {
+                break;
             }
         }
+
+        if (chain_heads) {
+            llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
+        }
+
+        // a failed decode is not retried: the rest of the batch is dropped
+        cu.done = ok ? cu.done + n : batch_dft.n_tokens;
+
+        return ok;
+    }
+
+    void cu_finish(const llama_batch & batch_in) {
+        const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_end[seq_id] < 0) {
@@ -1818,21 +1945,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
 
-            if (has_output) {
+            if (cu.has_output) {
                 verify_h_rows[seq_id] = n_rows;
                 verify_pos[seq_id]    = batch_in.pos[i_batch_beg[seq_id]];
                 verify_h[seq_id].resize((size_t) n_rows * n_embd);
 
                 for (int32_t i = 0; i < n_rows; ++i) {
-                    std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h_row(i_batch_beg[seq_id] + i), row_bytes);
+                    std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, cu_h_row(i_batch_beg[seq_id] + i), row_bytes);
                 }
             }
 
-            std::memcpy(pending_h[seq_id].data(), h_row(i_batch_end[seq_id]), row_bytes);
+            std::memcpy(pending_h[seq_id].data(), cu_h_row(i_batch_end[seq_id]), row_bytes);
             pending_pos[seq_id] = batch_in.pos[i_batch_end[seq_id]];
         }
 
-        return true;
+        cu.active = false;
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {

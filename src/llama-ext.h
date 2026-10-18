@@ -120,6 +120,12 @@ LLAMA_API float * llama_get_embeddings_nextn_for(struct llama_context * ctx, uin
 // in place (MTP's catch-up batch is the target's rows shifted by one behind the carried-over row).
 LLAMA_API bool llama_embeddings_nextn_has_spare_row(const struct llama_context * ctx);
 
+// Called by llama_decode on the decoding thread after ubatch i_ubatch of the batch has been enqueued, with the
+// batch tokens enqueued so far and in total. It may decode on another context, never on this one; the host
+// otherwise waits there for the pipeline (MTP runs the previous prompt chunk's draft catch-up in those waits).
+typedef void (*llama_ubatch_callback)(void * user_data, int32_t i_ubatch, int32_t n_tokens_done, int32_t n_tokens_all);
+LLAMA_API void llama_set_ubatch_callback(struct llama_context * ctx, llama_ubatch_callback cb, void * user_data);
+
 // Set whether the context outputs the input embeddings of a specific layer
 LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
 

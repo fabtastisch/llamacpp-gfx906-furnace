@@ -2131,6 +2131,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
+    int32_t i_ubatch       = 0;
 
     do {
         const auto & ubatch = mctx->get_ubatch();
@@ -2337,6 +2338,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
         turboprefill.finish_ubatch();
+
+        if (ubatch_cb) {
+            ubatch_cb(ubatch_cb_data, i_ubatch, (int32_t) n_tokens_prev, (int32_t) n_tokens_all);
+        }
+        i_ubatch++;
     } while (mctx->next());
 
     // The scheduler only reads turboprefill.stage while processing one ubatch graph.
@@ -4453,6 +4459,10 @@ float * llama_get_embeddings_nextn_for(llama_context * ctx, uint32_t decode_no) 
 
 bool llama_embeddings_nextn_has_spare_row(const llama_context * ctx) {
     return ctx->has_embeddings_nextn_spare_row();
+}
+
+void llama_set_ubatch_callback(llama_context * ctx, llama_ubatch_callback cb, void * user_data) {
+    ctx->set_ubatch_callback(cb, user_data);
 }
 
 float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {

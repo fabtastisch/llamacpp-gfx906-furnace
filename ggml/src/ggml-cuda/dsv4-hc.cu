@@ -346,7 +346,14 @@ static void ggml_cuda_op_dsv4_hc_post_impl(ggml_backend_cuda_context & ctx, ggml
             nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float), s_in, s_out);
 }
 
-void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+// gate_scale_in/gate_scale_out: the SCALE nodes of a fused SCALE -> SIGMOID -> SCALE chain feeding src[2]
+void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+        const ggml_tensor * gate_scale_in, const ggml_tensor * gate_scale_out) {
+    if (gate_scale_in != nullptr) {
+        ggml_cuda_op_dsv4_hc_post_impl(ctx, dst, gate_scale_in->src[0], true,
+                ggml_get_op_params_f32(gate_scale_in, 0), ggml_get_op_params_f32(gate_scale_out, 0));
+        return;
+    }
     ggml_cuda_op_dsv4_hc_post_impl(ctx, dst, dst->src[2], false, 1.0f, 1.0f);
 }
 

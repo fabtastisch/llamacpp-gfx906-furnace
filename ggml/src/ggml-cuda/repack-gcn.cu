@@ -4,6 +4,7 @@
 
 #include "ggml-backend-impl.h"
 #include "mmid.cuh"
+#include "mmid-bounds.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
 #include "ggml-quants.h"
@@ -5646,7 +5647,7 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
             src1->ne[1], src1->ne[2], 1, stream);
     };
     auto route = [&](int32_t * s1, int32_t * d, int32_t * b, int32_t * to, int32_t * te) {
-        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, s1, d, b,
+        ggml_cuda_launch_mm_ids_helper_bounds((const int32_t *) ids->data, s1, d, b,
             ne02, n_tokens, n_expert_used, src1->ne[1], si1, sis1, /*write_inverse =*/ false, stream);
         CUDA_CHECK(cudaGetLastError());
         repack_tile_map<16 * TN_ID><<<1, 1024, 0, stream>>>(b, to, te, ne02);
@@ -6237,12 +6238,14 @@ static size_t ggml_backend_cuda_repack_buffer_type_get_alloc_size(
 }
 
 static const ggml_backend_buffer_type_i ggml_backend_cuda_repack_buffer_type_interface = {
-    /* .get_name       = */ ggml_backend_cuda_repack_buffer_type_get_name,
-    /* .alloc_buffer   = */ ggml_backend_cuda_repack_buffer_type_alloc_buffer,
-    /* .get_alignment  = */ ggml_backend_cuda_repack_buffer_type_get_alignment,
-    /* .get_max_size   = */ nullptr,
-    /* .get_alloc_size = */ ggml_backend_cuda_repack_buffer_type_get_alloc_size,
-    /* .is_host        = */ nullptr,
+    /* .get_name         = */ ggml_backend_cuda_repack_buffer_type_get_name,
+    /* .alloc_buffer     = */ ggml_backend_cuda_repack_buffer_type_alloc_buffer,
+    /* .alloc_buffer_n   = */ nullptr,
+    /* .get_alignment    = */ ggml_backend_cuda_repack_buffer_type_get_alignment,
+    /* .get_max_size     = */ nullptr,
+    /* .get_alloc_size   = */ ggml_backend_cuda_repack_buffer_type_get_alloc_size,
+    /* .get_alloc_size_n = */ nullptr,
+    /* .is_host          = */ nullptr,
 };
 
 ggml_backend_buffer_type_t ggml_backend_cuda_repack_buffer_type(int device) {

@@ -571,18 +571,13 @@ public:
     void set_input(const llama_ubatch * ubatch) override {
         mctx->set_input_k_idxs(k_idxs, ubatch);
         mctx->set_input_v_idxs(v_idxs, ubatch);
-        if (k_rot) {
-            mctx->set_input_k_rot(k_rot);
-        }
-        if (v_rot) {
-            mctx->set_input_v_rot(v_rot);
-        }
     }
 
     ggml_tensor * k_idxs = nullptr;
     ggml_tensor * v_idxs = nullptr;
-    ggml_tensor * k_rot  = nullptr;
-    ggml_tensor * v_rot  = nullptr;
+    // the rotation constants of the cache, one per layer (null for a layer without rotation)
+    std::vector<ggml_tensor *> k_rot;
+    std::vector<ggml_tensor *> v_rot;
 
     const llama_kv_cache_context * mctx;
 };
@@ -592,7 +587,8 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     graph(model, params, no_build_t{}) {
     GGML_ASSERT(hparams.n_layer_nextn > 0 && "QWEN4EXP MTP requires n_layer_nextn > 0");
     GGML_ASSERT(hparams.n_layer_nextn == 1 && "QWEN4EXP MTP currently only supports a single MTP block");
-    GGML_ASSERT(ubatch.token && "QWEN4EXP MTP requires token input");
+    // image chunks reach the draft as embeddings (mainline #30397), text as tokens
+    ASSERT_EMBD_OR_TOKEN(ubatch);
 
     const int64_t hc     = hparams.dsv4_hc_mult;
     const int64_t hc_dim = hc * n_embd;
@@ -612,24 +608,28 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     int sections[4];
     std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
 
-    auto inp = std::make_unique<llm_graph_input_embd_h>(hc_dim);
+    // tokens go through the (shared) token embeddings below, the target's hidden state arrives as the ubatch's embd_state
+    auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd_inp(), hc_dim);
 
     inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
     ggml_set_input(inp->tokens);
 
-    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hc_dim, n_tokens);
+    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp(), n_tokens);
     ggml_set_input(inp->embd);
 
     inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hc_dim, n_tokens);
     ggml_set_input(inp->h);
     ggml_set_name(inp->h, "mtp_h_input");
 
-    ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
-    if (tok_embd_w == nullptr) {
-        tok_embd_w = qwen4exp_shared_model(cparams, model, "token_embd.weight").tok_embd;
-        GGML_ASSERT(tok_embd_w && "QWEN4EXP MTP: the target model has no token embeddings to borrow");
+    ggml_tensor * tok_embd = inp->embd;
+    if (ubatch.token) {
+        ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
+        if (tok_embd_w == nullptr) {
+            tok_embd_w = qwen4exp_shared_model(cparams, model, "token_embd.weight").tok_embd;
+            GGML_ASSERT(tok_embd_w && "QWEN4EXP MTP: the target model has no token embeddings to borrow");
+        }
+        tok_embd = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
     }
-    ggml_tensor * tok_embd   = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
     cb(tok_embd, "mtp_tok_embd", il);
 
     ggml_tensor * h_state = ggml_reshape_3d(ctx0, inp->h, n_embd, hc, n_tokens);
@@ -668,8 +668,8 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
         auto inp_s = std::make_unique<llm_graph_input_mtp_kv_store>(mctx_kv);
         inp_s->k_idxs = mctx_kv->build_input_k_idxs(ctx0, ubatch);
         inp_s->v_idxs = mctx_kv->build_input_v_idxs(ctx0, ubatch);
-        inp_s->k_rot  = mctx_kv->build_input_k_rot(ctx0);
-        inp_s->v_rot  = mctx_kv->build_input_v_rot(ctx0);
+        inp_s->k_rot  = mctx_kv->get_k_rot();
+        inp_s->v_rot  = mctx_kv->get_v_rot();
         inp_store = static_cast<llm_graph_input_mtp_kv_store *>(res->add_input(std::move(inp_s)));
     } else {
         inp_attn = build_attn_inp_kv();
@@ -716,11 +716,11 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
         cb(Vcur, "mtp_Vcur", il);
 
         // as build_attn: rotate before a quantized cache
-        if (inp_store->k_rot) {
-            Kcur = llama_mul_mat_hadamard(ctx0, Kcur, inp_store->k_rot);
+        if (inp_store->k_rot[il]) {
+            Kcur = llama_mul_mat_hadamard(ctx0, Kcur, inp_store->k_rot[il]);
         }
-        if (inp_store->v_rot) {
-            Vcur = llama_mul_mat_hadamard(ctx0, Vcur, inp_store->v_rot);
+        if (inp_store->v_rot[il]) {
+            Vcur = llama_mul_mat_hadamard(ctx0, Vcur, inp_store->v_rot[il]);
         }
 
         const auto * mctx_kv = inp_store->mctx;
@@ -893,7 +893,14 @@ public:
     static constexpr uint32_t QSA_SCORE_MIN_TOKENS = 64;
 
     void set_input(const llama_ubatch * ubatch) override {
+        // P5T (Claude, Messung shodan-llm#20): LLAMA_QSA_INPUT_TIME=1 logs the host time of k_idxs, set_input_qsa,
+        // set_input_qsa_re and blk_ids per call (INFO, -lv 4)
+        static const bool t_log = getenv("LLAMA_QSA_INPUT_TIME") != nullptr;
+        const int64_t t0 = t_log ? ggml_time_us() : 0;
+        int64_t t1 = t0, t2 = t0, t3 = t0;
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
+        t1 = t_log ? ggml_time_us() : 0;
+        t2 = t1;
         if (scores) {
             // with the block-key cache re-pooling a few blocks, no node reads the full block layout, so the graph does
             // not allocate it; the layout update still writes it, into host shadows
@@ -912,9 +919,12 @@ public:
                 pos = &t_pos;
             }
             mctx->set_input_qsa(cell_blk, cells, pos, bias, ubatch, ratio, blk_bias);
+            t2 = t_log ? ggml_time_us() : 0;
         }
+        t3 = t2;
         if (blk_mode == 2) {
             mctx->set_input_qsa_re(re_cells, re_pos, re_ids, ratio);
+            t3 = t_log ? ggml_time_us() : 0;
         }
         if (blk_mode == 1) {
             // the cache row of block b of the ubatch's stream s, s*n_blocks + b, in the flattened cache
@@ -928,6 +938,12 @@ public:
                     d[s*nb + b] = (s0 + s)*blk_rows + b;
                 }
             }
+        }
+        if (t_log) {
+            const int64_t t4 = ggml_time_us();
+            LLAMA_LOG_INFO("qsa_input: ratio %u n_ns %d n_kv %d mode %d: k_idxs %.3f qsa %.3f re %.3f ids %.3f ms\n",
+                    ratio, (int) (cell_blk ? cell_blk->ne[1] : 0), (int) (cell_blk ? cell_blk->ne[0] : 0), blk_mode,
+                    (t1 - t0)/1000.0, (t2 - t1)/1000.0, (t3 - t2)/1000.0, (t4 - t3)/1000.0);
         }
     }
 
@@ -1249,13 +1265,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         bool                      is_mask) {
     // rotate q/k/v before they reach a quantized cache, as the dense path does. the indexer
     // has already scored with its own query in build_qsa_top_k, so top_k is unaffected.
-    if (inp->self_k_rot) {
-        q_cur = llama_mul_mat_hadamard(ctx0, q_cur, inp->self_k_rot);
-        k_cur = llama_mul_mat_hadamard(ctx0, k_cur, inp->self_k_rot);
+    if (inp->self_k_rot[il]) {
+        q_cur = llama_mul_mat_hadamard(ctx0, q_cur, inp->self_k_rot[il]);
+        k_cur = llama_mul_mat_hadamard(ctx0, k_cur, inp->self_k_rot[il]);
     }
 
-    if (inp->self_v_rot) {
-        v_cur = llama_mul_mat_hadamard(ctx0, v_cur, inp->self_v_rot);
+    if (inp->self_v_rot[il]) {
+        v_cur = llama_mul_mat_hadamard(ctx0, v_cur, inp->self_v_rot[il]);
     }
 
     // these nodes are added to the graph together so that they are not reordered
@@ -1276,7 +1292,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
     }
 
-    ggml_tensor * kq_mask = inp->get_kq_mask();
+    ggml_tensor * kq_mask = inp->self_attn_mask.raw;
 
     // the selection's mask came straight from GGML_OP_QSA_MASK (or is the KQ mask when the window fits the budget)
     if (is_mask) {
@@ -1284,11 +1300,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         const int64_t width = std::min<int64_t>(kq_mask->ne[0], llm_graph_input_qsa::max_kept((uint32_t) r, hparams.indexer_top_k));
 
         ggml_tensor * cur = build_attn_mha(q_cur, mctx_cur->get_k(ctx0, il), mctx_cur->get_v(ctx0, il), nullptr, top_k,
-                nullptr, nullptr, width, kq_scale, il);
+                nullptr, nullptr, nullptr, width, kq_scale, il);
         cb(cur, "kqv_out", il);
 
-        if (inp->self_v_rot) {
-            cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
+        if (inp->self_v_rot[il]) {
+            cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot[il]);
         }
 
         return cur;
@@ -1324,12 +1340,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, top_k->ne[0], kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, nullptr, top_k->ne[0], kq_scale, il);
     cb(cur, "kqv_out", il);
 
     // the rotation is its own inverse, so undo it on the value side of the output
-    if (inp->self_v_rot) {
-        cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
+    if (inp->self_v_rot[il]) {
+        cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot[il]);
     }
 
     return cur;
@@ -1349,7 +1365,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     const bool qsa = mctx_hyb->get_idx() != nullptr && hparams.dsv4_compress_ratios[il] > 0;
 
     bool qsa_mask = false;
-    ggml_tensor * top_k = qsa ? build_qsa_top_k(mctx_hyb, cur, inp_pos, inp->get_kq_mask(), sections, il, &qsa_mask) : nullptr;
+    ggml_tensor * top_k = qsa ? build_qsa_top_k(mctx_hyb, cur, inp_pos, inp->self_attn_mask.raw, sections, il, &qsa_mask) : nullptr;
 
     // Qwen3Next uses a single Q projection that outputs query + gate
     ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]

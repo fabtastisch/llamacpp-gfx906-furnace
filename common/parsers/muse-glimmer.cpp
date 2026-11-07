@@ -38,16 +38,17 @@ common_chat_params common_chat_params_init_muse_glimmer(const common_chat_templa
             data.generation_prompt += "<|eom|><|start|>assistant to=user<|message|>" + msg.render_content();
         }
 
-        data.prompt += data.generation_prompt;
+        data.prompt.append(data.generation_prompt);
     }
 
     auto extract_reasoning = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
 
-    auto has_tools = inputs.tools.is_array() && !inputs.tools.empty();
-    // Constrained grammar whenever tools are offered.
-    auto include_grammar = has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
+    auto has_tools           = inputs.tools.is_array() && !inputs.tools.empty();
+    auto has_response_format = !inputs.json_schema.is_null() && inputs.json_schema.is_object();
+    // Constrained grammar whenever tools are offered or a response format is requested.
+    auto include_grammar     = has_response_format || (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE);
 
-    auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+    data.parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
         auto start = p.rule("start", p.literal("<|start|>assistant"));
 
         if (!extract_reasoning && !include_grammar) {
@@ -64,6 +65,15 @@ common_chat_params common_chat_params_init_muse_glimmer(const common_chat_templa
         auto recipient  = p.optional(p.literal(" to=user"));
         auto final_msg  = p.rule("final", recipient + p.literal("<|message|>") +
                                               p.content(p.until_one_of({ "<|eot|>", "<|eom|>" })));
+
+        if (has_response_format) {
+            auto response_json   = p.content(p.schema(p.json(), "response-format-schema", inputs.json_schema));
+            auto response_format = p.rule("response-format",
+                recipient + p.literal("<|message|>") +
+                ((p.literal("```json") + p.space() + response_json + p.space() + p.literal("```")) | response_json));
+
+            return p.zero_or_more(start + analysis) + start + response_format;
+        }
 
         if (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
             auto string_value = p.ac(
@@ -121,12 +131,10 @@ common_chat_params common_chat_params_init_muse_glimmer(const common_chat_templa
         return p.zero_or_more(start + analysis) + start + final_msg;
     });
 
-    data.parser = parser.save();
-
     if (include_grammar) {
-        data.grammar_lazy = inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_REQUIRED;
+        data.grammar_lazy = !(has_response_format || (has_tools && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED));
         data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
-            parser.build_grammar(builder, data.grammar_lazy);
+            data.parser.build_grammar(builder, data.grammar_lazy);
         });
         data.grammar_triggers = {
             { COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN,

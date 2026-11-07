@@ -90,7 +90,11 @@ static __global__ void ssm_conv_long_token_f32(const float * __restrict__ src0, 
 #pragma unroll
     for (int idx = 0; idx < total_elems; idx += split_d_inner) {
         if (row < (int)split_d_inner) {
-            smem[row * n_cols + col] = x_block[row * stride_x + col];
+            // Shodan-Fix 03.10.2026 (aus furnace 37526e035, upstream-Issues #20024/#21383): letzte z-Kachel hat
+            // local_n_t < split_n_t - ohne Grenze liest der Kernel hinter das Ende von conv_input. Der Rechenteil
+            // nutzt nur Spalten < d_conv-1+local_n_t, das genullte Ende wird nie verwendet (Ausgabe unveraendert).
+            const int valid_cols = d_conv - 1 + (int) local_n_t;
+            smem[row * n_cols + col] = col < valid_cols ? x_block[row * stride_x + col] : 0.0f;
         }
 
         col += split_d_inner;
@@ -151,9 +155,10 @@ static void ssm_conv_f32_cuda(const float * src0, const float * src1, const floa
         case 3:  launch_kernel(std::integral_constant<int, 3 >{}); break;
         case 4:  launch_kernel(std::integral_constant<int, 4 >{}); break;
         case 5:  launch_kernel(std::integral_constant<int, 5 >{}); break;
+        case 7:  launch_kernel(std::integral_constant<int, 7 >{}); break;
         case 9:  launch_kernel(std::integral_constant<int, 9 >{}); break;
         case 15: launch_kernel(std::integral_constant<int, 15>{}); break;
-        default: GGML_ABORT("Only support kernel sizes 3, 4, 5, 9, 15 right now.");
+        default: GGML_ABORT("Only support kernel sizes 3, 4, 5, 7, 9, 15 right now.");
     }
 }
 

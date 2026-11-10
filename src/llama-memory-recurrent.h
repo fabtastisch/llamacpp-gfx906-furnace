@@ -188,6 +188,9 @@ public:
 
     int32_t s_copy(int i) const;
 
+    uint32_t get_n_s_copy(uint32_t n_seqs) const;
+    void set_input_s_copy(int32_t * data, uint32_t n_seqs) const;
+
     // state rows the graph copies for cells in the range that the ubatch does not own
     uint32_t get_n_rs_extra(uint32_t n_seqs) const;
 

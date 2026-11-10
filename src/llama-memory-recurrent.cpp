@@ -299,6 +299,10 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
 
             cell_src.seq_id.insert(seq_id_dst);
             tail_dst.tail = tail_src.tail;
+            // a pending rollback of the old destination must not apply to the copied cell
+            if ((size_t) seq_id_dst < rs_idx.size()) {
+                rs_idx[seq_id_dst] = 0;
+            }
         }
     }
 }
@@ -652,6 +656,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             std::swap(dst_cell.pos, src_cell.pos);
             std::swap(dst_cell.src, src_cell.src);
             std::swap(dst_cell.seq_id, src_cell.seq_id);
+            std::swap(dst_cell.rs_max, src_cell.rs_max);
 
             // swap tails
             for (uint32_t j = 0; j < size; ++j) {
@@ -1397,6 +1402,38 @@ uint32_t llama_memory_recurrent_context::get_n_rs_extra(uint32_t n_seqs) const {
     }
 
     return 0;
+}
+
+uint32_t llama_memory_recurrent_context::get_n_s_copy(uint32_t n_seqs) const {
+    const uint32_t n_rs = get_n_rs();
+    return n_rs + (n_rs - n_seqs)*mem->n_rs_seq;
+}
+
+void llama_memory_recurrent_context::set_input_s_copy(int32_t * data, uint32_t n_seqs) const {
+    const uint32_t n_rs    = get_n_rs();
+    const uint32_t n_extra = n_rs - n_seqs;
+
+    // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
+    for (uint32_t i = 0; i < n_rs; ++i) {
+        auto & cell = mem->cells[i + mem->head];
+
+        bool pending = false;
+        if (i >= n_seqs && mem->n_rs_seq > 0 && !cell.seq_id.empty()) {
+            const llama_seq_id seq = *cell.seq_id.begin();
+            pending = seq >= 0 && (size_t) seq < mem->rs_idx.size() && mem->rs_idx[seq] != 0;
+        }
+
+        data[i] = s_copy(i);
+        if (pending) {
+            cell.rs_max = 0;
+        }
+    }
+
+    for (uint32_t p = 1; p <= mem->n_rs_seq; ++p) {
+        for (uint32_t j = 0; j < n_extra; ++j) {
+            data[n_rs + (p - 1)*n_extra + j] = (int32_t) (p*mem->size) + mem->cells[n_seqs + j + mem->head].src0;
+        }
+    }
 }
 
 int32_t llama_memory_recurrent_context::s_copy(int i) const {

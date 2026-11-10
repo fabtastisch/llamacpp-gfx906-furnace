@@ -6,7 +6,7 @@
 extern "C" {
 #endif
 
-#define RPC_PROTO_MAJOR_VERSION    8
+#define RPC_PROTO_MAJOR_VERSION    9
 #define RPC_PROTO_MINOR_VERSION    0
 #define RPC_PROTO_PATCH_VERSION    2  // furnace: GGML_OP_QSA_MASK appended after mainline GGML_OP_TOP_K_MASK
 

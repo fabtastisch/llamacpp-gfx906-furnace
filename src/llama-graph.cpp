@@ -4409,6 +4409,10 @@ void llm_graph_context::build_h_nextn_dev() const {
     }
 
     // the device buffer is only enabled for the unmasked extraction, which has a row per batch token
+    if (src->ne[0] != h_nextn_dev->ne[0]) {
+        GGML_ASSERT(ggml_nelements(src) == h_nextn_dev->ne[0]*n_tokens);
+        src = ggml_reshape_2d(ctx0, src, h_nextn_dev->ne[0], n_tokens);
+    }
     GGML_ASSERT(src->ne[0] == h_nextn_dev->ne[0] && ggml_nrows(src) == n_tokens);
 
     auto inp = std::make_unique<llm_graph_input_batch_idxs>();

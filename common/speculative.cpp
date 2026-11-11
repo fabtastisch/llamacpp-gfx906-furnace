@@ -1675,8 +1675,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         n_batch_tgt = (int32_t) llama_n_batch(ctx_tgt);
         verify_row0.assign(n_seq, -1);
 
-        // shared memory and chained heads keep the host rows
-        if (!is_mem_shared && !chain_heads) {
+        // deferred, shared memory and chained heads keep the host rows
+        static const bool no_defer = getenv("LLAMA_SPEC_NO_DEFER") != nullptr;
+        if (no_defer && !is_mem_shared && !chain_heads) {
             dev_rows = llama_set_embeddings_nextn_dev(ctx_tgt, true) && llama_set_embd_state_src(ctx_dft, ctx_tgt);
             if (!dev_rows) {
                 llama_set_embd_state_src(ctx_dft, nullptr);

@@ -588,7 +588,7 @@ static __device__ __forceinline__ float ggml_gcn_warp_reduce_sum_f32(float x) {
     if constexpr (width >=  8) { x += ggml_gcn_xfer_xor4_f32(x); }
     if constexpr (width >= 16) { x = ggml_gcn_add_xor8_f32(x); }
     if constexpr (width >= 32) { x += ggml_gcn_xfer_xor16_f32(x); }
-    if constexpr (width >= 64) { x += __shfl_xor_sync(0xffffffff, x, 32, 64); }
+    if constexpr (width >= 64) { x += ggml_cuda_shfl_xor(x, 32, 64); }
     return x;
 }
 
@@ -600,7 +600,7 @@ static __device__ __forceinline__ float ggml_gcn_warp_reduce_max_f32(float x) {
     if constexpr (width >=  8) { x = fmaxf(x, ggml_gcn_xfer_xor4_f32(x)); }
     if constexpr (width >= 16) { x = ggml_gcn_max_xor8_f32(x); }
     if constexpr (width >= 32) { x = fmaxf(x, ggml_gcn_xfer_xor16_f32(x)); }
-    if constexpr (width >= 64) { x = fmaxf(x, __shfl_xor_sync(0xffffffff, x, 32, 64)); }
+    if constexpr (width >= 64) { x = fmaxf(x, ggml_cuda_shfl_xor(x, 32, 64)); }
     return x;
 }
 
@@ -612,7 +612,7 @@ static __device__ __forceinline__ int ggml_gcn_warp_reduce_sum_i32(int x) {
     if constexpr (width >=  8) { x += ggml_gcn_xfer_xor_i32<4>(x); }
     if constexpr (width >= 16) { x += ggml_gcn_xfer_xor_i32<8>(x); }
     if constexpr (width >= 32) { x += ggml_gcn_xfer_xor_i32<16>(x); }
-    if constexpr (width >= 64) { x += __shfl_xor_sync(0xffffffff, x, 32, 64); }
+    if constexpr (width >= 64) { x += ggml_cuda_shfl_xor(x, 32, 64); }
     return x;
 }
 #endif // defined(GGML_USE_HIP) && defined(GCN)

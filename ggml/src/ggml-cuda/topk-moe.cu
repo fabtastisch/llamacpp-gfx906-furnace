@@ -87,7 +87,7 @@ static __device__ __forceinline__ int topk_moe_xfer(const int x) {
 #if defined(GGML_USE_HIP) && defined(GCN)
     return ggml_gcn_xfer_xor_i32<off>(x);
 #else
-    return __shfl_xor_sync(0xFFFFFFFF, x, off, WARP_SIZE);
+    return ggml_cuda_shfl_xor(x, off, WARP_SIZE);
 #endif // defined(GGML_USE_HIP) && defined(GCN)
 }
 
@@ -124,8 +124,8 @@ __device__ void group_mask_warp_inplace(float (&vals)[experts_per_thread], const
         }
 #pragma unroll
         for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
-            const float o1 = __shfl_xor_sync(0xFFFFFFFF, top1, offset, WARP_SIZE);
-            const float o2 = __shfl_xor_sync(0xFFFFFFFF, top2, offset, WARP_SIZE);
+            const float o1 = ggml_cuda_shfl_xor(top1, offset, WARP_SIZE);
+            const float o2 = ggml_cuda_shfl_xor(top2, offset, WARP_SIZE);
             top2 = fmaxf(fminf(top1, o1), fmaxf(top2, o2));
             top1 = fmaxf(top1, o1);
         }
@@ -137,10 +137,10 @@ __device__ void group_mask_warp_inplace(float (&vals)[experts_per_thread], const
     // rank of each group, lower index wins ties
     int rank = 0;
     for (int g = 0; g < n_groups; g++) {
-        const float other = __shfl_sync(0xFFFFFFFF, score, g, WARP_SIZE);
+        const float other = ggml_cuda_shfl(score, g, WARP_SIZE);
         rank += other > score || (other == score && g < lane);
     }
-    const auto keep = __ballot_sync(0xFFFFFFFFULL, lane < n_groups && rank < n_group_used);
+    const auto keep = ggml_cuda_ballot(lane < n_groups && rank < n_group_used, (ggml_cuda_thread_mask_t) 0xFFFFFFFFULL);
 
 #pragma unroll
     for (int i = 0; i < experts_per_thread; i++) {
@@ -295,9 +295,9 @@ __global__ void topk_moe_cuda(const float *         logits,
 
 #pragma unroll
             for (int mask = WARP_SIZE / 2; mask > 0; mask /= 2) {
-                const float val    = __shfl_xor_sync(0xFFFFFFFF, max_val, mask, WARP_SIZE);
-                const float val_s  = __shfl_xor_sync(0xFFFFFFFF, max_val_s, mask, WARP_SIZE);
-                const int   expert = __shfl_xor_sync(0xFFFFFFFF, max_expert, mask, WARP_SIZE);
+                const float val    = ggml_cuda_shfl_xor(max_val, mask, WARP_SIZE);
+                const float val_s  = ggml_cuda_shfl_xor(max_val_s, mask, WARP_SIZE);
+                const int   expert = ggml_cuda_shfl_xor(max_expert, mask, WARP_SIZE);
                 if (val_s > max_val_s || (val_s == max_val_s && expert < max_expert)) {
                     max_val    = val;
                     max_val_s  = val_s;

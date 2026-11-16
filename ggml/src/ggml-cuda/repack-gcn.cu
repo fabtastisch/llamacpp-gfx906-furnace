@@ -5518,7 +5518,7 @@ static const block_q8_1 * repack_quantize_x(ggml_backend_cuda_context & ctx, con
         const int64_t ne10_padded, ggml_cuda_pool_alloc<char> & fallback, cudaStream_t stream) {
     const size_t bytes = src1->ne[3] * src1->ne[2] * src1->ne[1] * ne10_padded * sizeof(block_q8_1) / QK8_1;
     auto quantize = [&](char * out) {
-        quantize_row_q8_1_cuda((const float *) src1->data, nullptr, out, GGML_TYPE_Q8_0, src1->ne[0],
+        quantize_row_q8_1_cuda((const float *) src1->data, out, src1->ne[0],
             src1->nb[1] / sizeof(float), src1->nb[2] / sizeof(float), src1->nb[3] / sizeof(float),
             ne10_padded, src1->ne[1], src1->ne[2], src1->ne[3], stream);
     };
@@ -5643,8 +5643,8 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
     auto quantize_x = [&](char * xq_out) {
         const int64_t s11 = src1->nb[1] / sizeof(float);
         const int64_t s12 = src1->nb[2] / sizeof(float);
-        quantize_row_q8_1_cuda((const float *) src1->data, nullptr, xq_out,
-            src0->type, ne10, s11, s12, s12 * src1->ne[2], ne10_padded,
+        quantize_row_q8_1_cuda((const float *) src1->data, xq_out,
+            ne10, s11, s12, s12 * src1->ne[2], ne10_padded,
             src1->ne[1], src1->ne[2], 1, stream);
     };
     auto route = [&](int32_t * s1, int32_t * d, int32_t * b, int32_t * to, int32_t * te) {

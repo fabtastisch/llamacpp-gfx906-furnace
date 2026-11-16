@@ -147,7 +147,7 @@ static __device__ __forceinline__ int qsa_mask_round_prefix(const bool f, int * 
     const int      in_w = __popcll(bal & ((uint64_t(1) << lane) - 1));
     const int      n_w  = __popcll(bal);
 #else
-    const uint32_t bal  = __ballot_sync(0xffffffff, f);
+    const uint32_t bal  = ggml_cuda_ballot(f, (ggml_cuda_thread_mask_t) 0xffffffff);
     const int      in_w = __popc(bal & ((1u << lane) - 1));
     const int      n_w  = __popc(bal);
 #endif

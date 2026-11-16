@@ -15,6 +15,7 @@ export type {
 	ApiModelsSseProgress,
 	ApiModelsSseData,
 	ApiModelsSseDownloadProgressData,
+	ApiModelsSseDownloadFailedData,
 	ApiModelsSseEvent,
 	ApiModelsDownloadRequest,
 	ApiModelsDownloadResponse,
@@ -47,6 +48,7 @@ export type {
 	HfModelGguf,
 	HfModelInfo,
 	HfModelSearchParams,
+	HfMmprojEncoders,
 	HfModelSibling,
 	HfModelSiblingRef
 } from './huggingface';
@@ -197,6 +199,9 @@ export type {
 	MCPResourceSubscription,
 	MCPServerResources
 } from './mcp';
+
+// Group types
+export type { Group } from './groups';
 
 // Search result types
 export type { SearchResult } from './search';
